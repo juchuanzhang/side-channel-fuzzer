@@ -4,6 +4,32 @@
 // Copyright (C) Microsoft Corporation
 // SPDX-License-Identifier: MIT
 
+// 【客户机页表管理总体架构】
+// 本文件实现了"Enter, Exit, Page Fault, Leak"论文Section 5.2中描述的客户机(Guest)页表管理功能。
+//
+// 在硬件虚拟化(VMX/SVM)环境下，内存映射涉及两层页表：
+//   1. 客户机页表(Guest PT): 客户机虚拟地址(GVA) -> 客户机物理地址(GPA)
+//      结构与常规x86_64页表相同：L4(PML4) -> L3(PDPT) -> L2(PD) -> L1(PT)
+//   2. 扩展页表(EPT/NPT): 客户机物理地址(GPA) -> 宿主机物理地址(HPA)
+//      Intel称为EPT，AMD称为NPT；结构为4级：L4 -> L3 -> L2 -> L1
+//
+// 本文件的核心功能：
+//   - set_guest_page_tables(): 创建客户机4级页表，将GVA映射到GPA
+//     - 支持HPA-GPA碰撞功能：将客户机数据页面的GPA直接映射到宿主机沙箱的HPA，
+//       使宿主机和客户机访问同一物理内存（内存别名），这是侧信道fuzzer的关键特性
+//   - set_extended_page_tables(): 创建EPT，将GPA映射到HPA
+//     - 将宿主机沙箱内存映射到客户机地址空间
+//   - update_eptp(): 配置EPTP(EPT指针)寄存器值，包含EPT基址、内存类型、遍历深度等
+//   - set_faulty_page_guest_permissions(): 修改客户机页表中faulty页面的权限
+//   - set_faulty_page_ept_permissions(): 修改EPT中faulty页面的权限
+//   - restore_faulty_page_*_permissions(): 恢复faulty页面的原始权限
+//
+// 4级客户机页表结构(x86_64)：
+//   L4(PML4E): 512个条目，索引[47:39]，指向L3页表
+//   L3(PDPTE): 512个条目，索引[38:30]，指向L2页表  
+//   L2(PDE):   512个条目，索引[29:21]，指向L1页表
+//   L1(PTE):   512个条目，索引[20:12]，指向4KB物理页
+
 #include <asm/io.h>
 #include <asm/msr.h>
 
@@ -16,6 +42,14 @@
 #include "page_tables_common.h"
 #include "page_tables_guest.h"
 
+// 【PTE/EPT初始化宏定义】
+// INIT_PTE: 初始化客户机页表条目，设置权限位(Present/Write/User/WriteThrough/CacheDisable/XD/Accessed)
+//           和物理地址(paddr >> 12，因为PTE中物理地址是页帧号而非完整地址)
+// INIT_EPTE: 初始化扩展页表条目，Intel和AMD的EPT格式不同：
+//   - Intel EPT: 权限位为Read/Write/Execute，无XD位(使用独立的execute_access位)
+//   - AMD NPT: 权限位为Present/Write/User/WriteThrough/CacheDisable/XD(与传统PTE类似)
+// INIT_PTE_DEFAULT: 默认PTE配置 — Present=1, Write=1, User=0(仅内核可访问), XD=0(可执行)
+// INIT_EPTE_DEFAULT: 默认EPT配置 — Read=1, Write=1, Execute=1(完全可访问)
 #define INIT_PTE(PTE, PADDR, P, W, US, PWT, PCD, XD, A)                                            \
     {                                                                                              \
         (PTE).present = P;                                                                         \
@@ -51,6 +85,9 @@
     }
 #endif
 
+// 【EPT条目判断宏】不同CPU厂商的EPT格式差异：
+// Intel: 存在性由read_access位决定，可执行性由execute_access位决定，用户访问性由user_ex_access位决定
+// AMD: 存在性由present位决定，可执行性由execute_disable位(取反)决定，用户访问性由user_supervisor位决定
 #define INIT_PTE_DEFAULT(PTE, PADDR)  INIT_PTE(PTE, PADDR, 1, 1, 0, 0, 0, 0, 1)
 #define INIT_EPTE_DEFAULT(PTE, PADDR) INIT_EPTE(PTE, PADDR, 1, 1, 1, 1)
 
@@ -73,6 +110,13 @@
 #endif
 
 eptp_t *ept_ptr = NULL; // global
+// 【全局数据结构】
+// allocated_page_tables: 每个actor的客户机4级页表(L4/L3/L2/L1)
+// allocated_extended_page_tables: 每个actor的EPT/NPT(L4/L3/L2/L1)
+// allocated_guest_gdts: 每个actor的GDT(全局描述符表)，用于客户机段描述符配置
+// guest_memory_translations: GVA->GPA->HPA->HVA的快速翻译表，加速地址转换查找
+// vmlaunch_page: 包含单条VMCALL指令的页面，用于将VM置为已启动状态
+// faulty_ptes/faulty_eptes: 保存faulty页面的原始PTE/EPT值，用于快速恢复
 
 static actor_page_table_t *allocated_page_tables = NULL;
 static actor_ept_t *allocated_extended_page_tables = NULL;
@@ -93,6 +137,11 @@ static bool ept_is_set = false;
 /// for a physical address in page tables (or at least I couldn't find one)
 /// @param hpa Host physical address to translate
 /// @return Host virtual address in high memory
+// 【phys_to_vmalloc - HPA到HVA转换】
+// 作用：根据宿主机物理地址(HPA)查找对应的宿主机虚拟地址(HVA)。
+// 为什么需要？内核没有提供根据物理地址搜索页表的接口，因此需要使用预先建立的
+// guest_memory_translations翻译表进行查找。
+// 实现：遍历翻译表中的所有hgpa_t条目，匹配hpa字段，返回对应的hva。
 static void *phys_to_vmalloc(uint64_t hpa, int actor_id)
 {
     hgpa_t *flat_translations = (hgpa_t *)&guest_memory_translations[actor_id];
@@ -106,6 +155,10 @@ static void *phys_to_vmalloc(uint64_t hpa, int actor_id)
 
 static inline bool gpa_is_valid(hgpa_t *translations, uint64_t gpa)
 {
+    // 【gpa_is_valid - GPA有效性验证】
+    // 作用：检查给定的客户机物理地址(GPA)是否在翻译表中存在有效映射。
+    // 用途：在EPT调试输出中，当启用HPA-GPA碰撞时，同一个HPA可能映射到多个GPA，
+    //       需要过滤掉未使用的GPA映射，只输出有效映射。
     for (int i = 0; i < sizeof(guest_memory_translations_t) / sizeof(hgpa_t); i++) {
         if (translations[i].gpa == gpa) {
             return true;
@@ -116,6 +169,10 @@ static inline bool gpa_is_valid(hgpa_t *translations, uint64_t gpa)
 
 static inline int set_last_pt_level(pte_t_ *pt, hgpa_t *translation, uint64_t paddr, uint64_t vaddr)
 {
+    // 【set_last_pt_level - 设置客户机页表L1(PTE)级别条目】
+    // 作用：在客户机页表的最后一级(L1/PTE)中设置映射条目，将GVA映射到GPA。
+    // 这是4级页表遍历的最后一步，直接映射4KB页面。
+    // 同时更新翻译表：记录GPA和GVA的对应关系，供后续EPT设置和地址查找使用。
     size_t pt_index = PT_INDEX(vaddr);
     ASSERT(pt[pt_index].present == 0, "set_last_pt_level");
     INIT_PTE_DEFAULT(pt[pt_index], paddr);
@@ -129,7 +186,23 @@ static inline int set_last_pt_level(pte_t_ *pt, hgpa_t *translation, uint64_t pa
 static inline int set_ept_entry(actor_ept_t *actor_ept_base, hgpa_t *translation, uint64_t l3_hpa,
                                 uint64_t l2_hpa, uint64_t l1_hpa, void *hva)
 {
-    // get the addresses to map
+    // 【set_ept_entry - 设置EPT映射条目】
+    // 作用：在EPT的所有4个级别中设置映射，将GPA(客户机物理地址)转换为HPA(宿主机物理地址)。
+    // EPT 4级结构：L4(EPML4E) -> L3(EPDPTE) -> L2(EPDE) -> L1(EPTE)
+    // 
+    // 输入参数：
+    //   - actor_ept_base: 当前actor的EPT结构（包含L4/L3/L2/L1四个页表）
+    //   - translation: 翻译条目，记录GPA->HPA->HVA的映射关系
+    //   - l3_hpa/l2_hpa/l1_hpa: EPT中间级页表的宿主机物理地址
+    //   - hva: 要映射的宿主机虚拟地址，通过vmalloc_to_phys转换为HPA
+    //
+    // 映射过程：
+    //   1. 从translation->gpa获取客户机物理地址(GPA)
+    //   2. 通过vmalloc_to_phys将HVA转换为HPA
+    //   3. 检查EPT L1条目是否未被占用（避免碰撞）
+    //   4. 设置EPT的4个级别：L4/L3/L2使用GPA对应位段作为索引，指向下一级EPT页表
+    //   5. L1(叶级)使用GPA的[20:12]位作为索引，映射到HPA
+    //   6. 设置L1的特殊属性：dirty=1(脏页标记)、内存类型(WB=6)、忽略PAT(Intel)或PAT=1(AMD)
     uint64_t gpa = translation->gpa;
     uint64_t hpa = vmalloc_to_phys(hva);
 
@@ -168,6 +241,28 @@ static inline int set_ept_entry(actor_ept_t *actor_ept_base, hgpa_t *translation
 /// guest_memory_t (see guest_page_tables.h), with the base address GUEST_MEMORY_START
 /// @param void
 /// @return 0 on success, -1 on failure
+// 【set_guest_page_tables - 创建客户机4级页表】
+// 作用：为每个客户机(Guest)actor创建4级页表，将GVA(客户机虚拟地址)映射到GPA(客户机物理地址)。
+//
+// 客户机页表的4级结构：
+//   L4(PML4): 只使用一个条目(PML4_INDEX(GUEST_V_MEMORY_START))，指向L3页表
+//   L3(PDPT): 只使用一个条目(PDPT_INDEX(GUEST_V_MEMORY_START))，指向L2页表
+//   L2(PD):   只使用一个条目(PDT_INDEX(GUEST_V_MEMORY_START))，指向L1页表
+//   L1(PT):   使用多个条目，分别映射util/data/code/gdt/vmlaunch等区域
+//
+// 关键设计：
+//   - L4/L3/L2只使用一个条目，因为沙箱内存区域很小，所有地址共享同一组上级页表条目
+//   - GPA的设置方式：为方便管理，客户机页表本身的GPA设为与GVA相同值（自映射式布局）
+//   - HPA-GPA碰撞功能：当enable_hpa_gpa_collisions启用时，data/code区域的GPA
+//     直接指向宿主机沙箱的HPA(vmalloc_to_phys)，实现内存别名，使宿主机和客户机
+//     访问同一物理内存页面，这是侧信道攻击的基础条件
+//
+// 映射的区域（每个区域逐页映射）：
+//   1. util_t: 工具页面（测量结果存储），所有actor共享
+//   2. actor_data_t: 数据页面，每个actor独立（支持HPA-GPA碰撞）
+//   3. actor_code_t: 代码页面，每个actor独立（支持HPA-GPA碰撞）
+//   4. GDT: 全局描述符表，每个actor独立
+//   5. VMLAUNCH页面: 包含VMCALL指令的特殊页面
 static int set_guest_page_tables(void)
 {
     int err = 0;
@@ -199,6 +294,9 @@ static int set_guest_page_tables(void)
         // For convenience, we set GPA of the page tables to the same value as their GVA
         // Also, since the actor's sandbox is fairly small, the first three levels are identical
         // for all addresses within the actor memory
+        // 【设置L4/L3/L2级别】由于沙箱内存区域较小，所有地址共享相同的前三级页表条目。
+        // 采用"GPA=GVA"的映射策略，使页表自身的物理地址与虚拟地址相同，简化地址管理。
+        // 翻译表guest_page_tables[3..0]分别记录L4/L3/L2/L1页表的GPA。
         actor_page_table_t *page_table = &allocated_page_tables[actor_id];
         actor_page_table_t *page_table_gpa = &guest_p_memory->guest_page_tables;
         translations->guest_page_tables[3].gpa = (uint64_t)&page_table_gpa->l4;
@@ -219,6 +317,10 @@ static int set_guest_page_tables(void)
         translations->guest_page_tables[0].gpa = l1_gpa;
 
         // set the last level of the page table for each area of the actor sandbox
+        // 【设置L1(PTE)级别 - 各区域的逐页映射】
+        // 以下逐页设置L1级别的PTE条目，将每个4KB页面映射到对应的GPA
+        
+        // util区域：所有actor共享，GPA直接指向客户机物理内存中的util区域
         for (int i = 0; i < sizeof(util_t); i += 4096) {
             vaddr = ((uint64_t)&guest_v_memory->util) + i;
             paddr = ((uint64_t)&guest_p_memory->util) + i;
@@ -226,6 +328,14 @@ static int set_guest_page_tables(void)
             CHECK_ERR("set_guest_page_tables");
         }
         for (int i = 0; i < sizeof(actor_data_t); i += 4096) {
+            // 【HPA-GPA碰撞（内存别名）功能】
+            // 当enable_hpa_gpa_collisions启用时，客户机数据页面的GPA不指向客户机物理内存，
+            // 而直接指向宿主机沙箱(sandbox->data[0])对应的HPA(vmalloc_to_phys转换)。
+            // 这使得客户机和宿主机访问同一物理内存页面，形成内存别名(alias)。
+            // 作用：宿主机actor(在Ring 0执行)和客户机actor(在VM中执行)共享同一数据页面，
+            //       客户机修改的数据可以直接被宿主机读取，反之亦然。这是跨VM侧信道通信的基础。
+            // 注意：data区域使用sandbox->data[0]（第一个actor的数据页面）作为别名目标，
+            //       因为所有actor的data页面在沙箱中是连续分配的。
             uint64_t vaddr = ((uint64_t)&guest_v_memory->data) + i;
             if (enable_hpa_gpa_collisions) {
                 uint64_t aliased_vaddr = ((uint64_t)&sandbox->data[0]) + i;
@@ -237,6 +347,8 @@ static int set_guest_page_tables(void)
             CHECK_ERR("set_guest_page_tables");
         }
         for (int i = 0; i < sizeof(actor_code_t); i += 4096) {
+            // 【代码区域的HPA-GPA碰撞】与data区域同理，code区域也支持HPA-GPA碰撞功能，
+            // 使宿主机和客户机共享同一代码页面。
             vaddr = ((uint64_t)&guest_v_memory->code) + i;
             if (enable_hpa_gpa_collisions) {
                 uint64_t aliased_vaddr = ((uint64_t)&sandbox->code[0]) + i;
@@ -248,12 +360,15 @@ static int set_guest_page_tables(void)
             CHECK_ERR("set_guest_page_tables");
         }
         { // GDT (indentation is for readability)
+            // 【GDT映射】全局描述符表(GDT)映射到客户机物理内存，每个actor有独立的GDT
             vaddr = (uint64_t)&guest_v_memory->gdt;
             paddr = (uint64_t)&guest_p_memory->gdt;
             err = set_last_pt_level(page_table->l1, &translations->gdt[0], paddr, vaddr);
             CHECK_ERR("set_guest_page_tables");
         }
         { // VMLAUNCH page (indentation is for readability)
+            // 【VMLAUNCH页面】包含VMCALL指令(0x0f 0x01 0xc1)的特殊页面，
+            // 用于将VM从VMLAUNCH状态转为运行状态
             vaddr = (uint64_t)&guest_v_memory->vmlaunch_page[0];
             paddr = (uint64_t)&guest_p_memory->vmlaunch_page[0];
             err = set_last_pt_level(page_table->l1, &translations->vmlaunch_page[0], paddr, vaddr);
@@ -270,6 +385,24 @@ static int set_guest_page_tables(void)
 /// GUEST_MEMORY_START
 /// @param void
 /// @return 0 on success, -1 on failure
+// 【set_extended_page_tables - 创建EPT映射】
+// 作用：为每个客户机actor创建扩展页表(EPT/NPT)，将GPA映射到HPA。
+// EPT是硬件虚拟化的第二层地址转换：GVA -> GPA（由客户机PT完成） -> HPA（由EPT完成）
+//
+// EPT映射流程：
+//   1. 获取当前actor的EPT结构和翻译表
+//   2. 获取EPT中间级(L3/L2/L1)页表的HPA（通过vmalloc_to_phys转换虚拟地址）
+//   3. 对每个内存区域逐页调用set_ept_entry()，设置4级EPT映射
+//
+// 映射区域：
+//   - util_t: 共享的工具页面，所有actor映射同一宿主机物理内存(sandbox->util)
+//   - actor_data_t: 每个actor独立的数据页面(sandbox->data[actor_id])
+//   - actor_code_t: 每个actor独立的代码页面(sandbox->code[actor_id])
+//   - GDT: 每个actor独立的GDT(allocated_guest_gdts[actor_id])
+//   - VMLAUNCH页面: 共享的VMCALL指令页面
+//   - 客户机页表自身: 逐页映射allocated_page_tables到EPT中，使客户机可以访问自己的页表
+//
+// 前置条件：guest_pt_is_set必须为true（客户机页表已设置），因为EPT需要使用翻译表中的GPA
 static int set_extended_page_tables(void)
 {
     int err = 0;
@@ -288,11 +421,15 @@ static int set_extended_page_tables(void)
         guest_memory_translations_t *translations = &guest_memory_translations[actor_id];
 
         // get addresses of the last three levels
+        // 【获取EPT中间级页表的HPA】EPT中间级(L3/L2/L1)页表存储在vmalloc分配的内存中，
+        // 需要将其虚拟地址转换为物理地址(HPA)，作为EPT条目中的下一级页表指针。
         uint64_t l3_hpa = vmalloc_to_phys((void *)ept_base->l3);
         uint64_t l2_hpa = vmalloc_to_phys((void *)ept_base->l2);
         uint64_t l1_hpa = vmalloc_to_phys((void *)ept_base->l1);
 
         // map util_t into guest memory (the same phys range for all actors, i.e., shared)
+        // 【util区域EPT映射】所有actor共享同一个util区域(sandbox->util[0])，
+        // 映射到同一个宿主机物理地址范围
         for (int i = 0; i < sizeof(util_t) / PAGE_SIZE; i += 1) {
             void *hva = (void *)&sandbox->util[0] + (i * PAGE_SIZE);
             err = set_ept_entry(ept_base, &translations->util[i], l3_hpa, l2_hpa, l1_hpa, hva);
@@ -300,6 +437,8 @@ static int set_extended_page_tables(void)
         }
 
         // map actor_data_t, actor_code_t, and GDT into guest memory (each actor has its own)
+        // 【actor独占区域EPT映射】data/code/GDT每个actor有自己独立的映射，
+        // 使用sandbox->data[actor_id]等获取对应actor的宿主机虚拟地址
         for (int i = 0; i < sizeof(actor_data_t) / PAGE_SIZE; i += 1) {
             void *hva = (void *)&sandbox->data[actor_id] + (i * PAGE_SIZE);
             err = set_ept_entry(ept_base, &translations->data[i], l3_hpa, l2_hpa, l1_hpa, hva);
@@ -323,6 +462,9 @@ static int set_extended_page_tables(void)
         }
 
         // map guest page tables
+        // 【客户机页表自身的EPT映射】客户机页表也需要映射到EPT中，
+        // 因为客户机在运行时需要通过GVA访问自己的页表结构（如修改PTE权限时）。
+        // 逐页映射allocated_page_tables[actor_id]到EPT的GPA空间。
         for (int i = 0; i < sizeof(actor_page_table_t) / PAGE_SIZE; i += 1) {
             void *hva = (void *)&allocated_page_tables[actor_id] + (i * PAGE_SIZE);
             err = set_ept_entry(ept_base, &translations->guest_page_tables[i], l3_hpa, l2_hpa,
@@ -339,6 +481,15 @@ static int set_extended_page_tables(void)
 /// tables
 /// @param void
 /// @return 0 on success, -1 on failure
+// 【update_eptp - 更新EPT指针】
+// 作用：为每个actor配置EPTP(EPT Pointer)寄存器值，VMX的VMLAUNCH/VMENTRY指令使用
+// EPTP来定位EPT的基址和属性。
+// EPTP结构(x86_64)：
+//   - memory_type: EPT内存类型，WB(WriteBack=6)是最高性能的缓存模式
+//   - page_walk_length: EPT遍历深度，3表示4级EPT(L4->L3->L2->L1，长度=4-1=3)
+//   - ad_enabled: 访问位和脏位(A/D bits)启用，用于跟踪页面访问和修改状态
+//   - superv_sdw_stack: Supervisor Shadow Stack控制位(通常为0)
+//   - paddr: EPT L4页表的物理地址(页帧号格式，地址>>12)
 static int update_eptp(void)
 {
     ASSERT(ept_is_set, "update_eptp");
@@ -358,6 +509,9 @@ static int update_eptp(void)
 
 int map_sandbox_to_guest_memory(void)
 {
+    // 【沙箱到客户机内存映射的主入口】
+    // 执行流程：1. 设置客户机页表(GVA->GPA) -> 2. 设置EPT(GPA->HPA) -> 3. 更新EPT指针
+    // 必须按此顺序执行，因为EPT设置依赖客户机页表中建立的翻译表(GPA值)。
     int err = 0;
     ASSERT(allocated_page_tables != NULL, "map_sandbox_to_guest_memory");
     ASSERT(allocated_extended_page_tables != NULL, "map_sandbox_to_guest_memory");
@@ -377,6 +531,14 @@ int map_sandbox_to_guest_memory(void)
 
 /// @brief Set permissions on the faulty page based on the actor's metadata (for each actor)
 /// @param void
+// 【set_faulty_page_guest_permissions - 设置客户机PT中faulty页面的权限】
+// 作用：在客户机页表的L1级别修改faulty数据页面的PTE权限位。
+// 实现方式：与宿主机版本(set_faulty_page_host_permissions)类似，
+//   1. 计算faulty页面的GVA，通过PT_INDEX获取L1表中的索引
+//   2. 从actor->data_permissions提取权限掩码(mask_set/mask_clear)
+//   3. 保存原始PTE到faulty_ptes[]，用于后续恢复
+//   4. 应用权限掩码：pte = (org_pte | mask_set) & mask_clear
+// 注意：客户机PT修改不需要TLB刷新，因为客户机TLB在VM Entry/Exit时自动刷新
 void set_faulty_page_guest_permissions(void)
 {
     guest_memory_t *guest_v_memory = (guest_memory_t *)(GUEST_V_MEMORY_START);
@@ -406,6 +568,9 @@ void set_faulty_page_guest_permissions(void)
 
 void restore_faulty_page_guest_permissions(void)
 {
+    // 【restore_faulty_page_guest_permissions - 恢复客户机PT中faulty页面的权限】
+    // 作用：将每个客户机actor的faulty页面PTE恢复为set_faulty_page_guest_permissions()
+    // 执行前保存的原始值(faulty_ptes[actor_id])。
     guest_memory_t *guest_v_memory = (guest_memory_t *)(GUEST_V_MEMORY_START);
     uint64_t vaddr = ((uint64_t)&guest_v_memory->data.faulty_area[0]);
     size_t index = PT_INDEX(vaddr);
@@ -421,6 +586,14 @@ void restore_faulty_page_guest_permissions(void)
 
 /// @brief Set EPT permissions on the faulty page based on the actor's metadata (for each actor)
 /// @param void
+// 【set_faulty_page_ept_permissions - 设置EPT中faulty页面的权限】
+// 作用：在EPT的L1级别修改faulty数据页面的EPT权限位。
+// 与客户机PT版本的区别：
+//   - 使用actor->data_ept_properties而非data_permissions（EPT和PT的权限位格式不同）
+//   - 使用MODIFIABLE_EPTE_BITS而非MODIFIABLE_PTE_BITS（EPT可修改的位集合不同）
+//   - EPT权限位含义：Intel(Read/Write/Execute)，AMD(Present/Write/XD)
+//   - GPA通过翻译表(translations->data[FAULTY_PAGE_ID].gpa)获取，而非直接计算
+// 实现方式与PT版本类似：保存原始EPT值 -> 应用掩码 -> 仅在改变时写入
 void set_faulty_page_ept_permissions(void)
 {
     for (int actor_id = 0; actor_id < n_actors; actor_id++) {
@@ -450,6 +623,9 @@ void set_faulty_page_ept_permissions(void)
 
 void restore_faulty_page_ept_permissions(void)
 {
+    // 【restore_faulty_page_ept_permissions - 恢复EPT中faulty页面的权限】
+    // 作用：将每个客户机actor的faulty页面EPT条目恢复为原始值(faulty_eptes[actor_id])。
+    // 与客户机PT恢复类似，使用预先保存的值直接覆盖EPT的L1条目。
     for (int actor_id = 0; actor_id < n_actors; actor_id++) {
         actor_metadata_t *actor = &actors[actor_id];
         if (actor->mode != MODE_GUEST)
@@ -614,6 +790,18 @@ int dbg_dump_ept(int actor_id)
 // =================================================================================================
 int allocate_guest_page_tables()
 {
+    // 【allocate_guest_page_tables - 分配客户机页表和EPT的内存】
+    // 作用：为所有actor分配客户机页表(actor_page_table_t)、EPT(actor_ept_t)、
+    //       GDT(actor_gdt_t)和翻译表(guest_memory_translations_t)的内存。
+    // 
+    // 内存分配策略：
+    //   - 页表和EPT使用vmalloc分配（因为它们很大，kmalloc可能失败）
+    //   - 翻译表和vmlaunch_page使用kmalloc分配（较小，需要物理连续内存）
+    //   - 如果actor数量没有增加(n_actors <= old_n_actors)，仅清零现有内存而不重新分配
+    //
+    // vmlaunch_page的特殊处理：
+    //   这是一个包含VMCALL指令(0x0f 0x01 0xc1)的4KB页面，
+    //   用于在VMLAUNCH后通过VMCALL将VM置于已启动状态
     ASSERT(n_actors < 64, "allocate_guest_page_tables");
 
     static size_t old_n_actors = 0;
@@ -632,17 +820,23 @@ int allocate_guest_page_tables()
     SAFE_FREE(vmlaunch_page);
 
     // Guest page tables
+    // 【客户机4级页表】每个actor需要一套完整的4级页表(L4/L3/L2/L1)，
+    // 结构actor_page_table_t包含这4个页表，每个页表4KB(512个8字节条目)
     allocated_page_tables =
         (actor_page_table_t *)CHECKED_VMALLOC(n_actors * sizeof(actor_page_table_t));
     memset(allocated_page_tables, 0, n_actors * sizeof(actor_page_table_t));
 
     // EPTs
+    // 【扩展页表】每个actor需要一套完整的4级EPT(L4/L3/L2/L1)，
+    // 结构actor_ept_t包含这4个EPT页表，每个页表4KB
     allocated_extended_page_tables = (actor_ept_t *)CHECKED_VMALLOC(n_actors * sizeof(actor_ept_t));
     memset(allocated_extended_page_tables, 0, n_actors * sizeof(actor_ept_t));
 
     allocated_guest_gdts = CHECKED_VMALLOC(n_actors * sizeof(actor_gdt_t));
 
     // Fast translations
+    // 【快速翻译表】记录每个页面的GVA->GPA->HPA->HVA映射关系，
+    // 用于加速地址转换和EPT设置中的HPA查找
     guest_memory_translations = CHECKED_ZALLOC(n_actors * sizeof(guest_memory_translations_t));
 
     // A page with a single VMCALL instruction; used to put the VM into launched state
@@ -661,6 +855,8 @@ int allocate_guest_page_tables()
 
 void free_guest_page_tables(void)
 {
+    // 【释放客户机页表相关内存】安全释放所有分配的资源，包括页表、EPT、GDT、翻译表等。
+    // 使用SAFE_VFREE释放vmalloc分配的内存，SAFE_FREE释放kmalloc分配的内存。
     SAFE_VFREE(allocated_page_tables);
     SAFE_VFREE(allocated_extended_page_tables);
     SAFE_VFREE(allocated_guest_gdts);

@@ -4,6 +4,24 @@
 // Copyright (C) Microsoft Corporation
 // SPDX-License-Identifier: MIT
 
+// 【页表管理总体架构】
+// 本文件实现了"Enter, Exit, Page Fault, Leak"论文Section 5.2中描述的宿主机(Host)页表管理功能。
+// 
+// 核心思路：fuzzer通过直接修改内核页表项(PTE)来控制沙箱页面的访问权限，从而构造
+// 微架构侧信道攻击条件。整个流程如下：
+//   1. get_pte(): 手动遍历内核页表，获取任意内核虚拟地址对应的PTE指针
+//   2. cache_host_pteps(): 在初始化时缓存所有沙箱页面的PTE指针，避免每次都重新遍历页表
+//   3. store_orig_host_permissions(): 保存沙箱页面的原始PTE值，用于后续恢复
+//   4. set_user_pages(): 为用户态(user)actor设置页面权限（添加U/S位），使其可在Ring 3访问
+//   5. set_faulty_page_host_permissions(): 修改faulty页面的PTE权限位，构造侧信道条件
+//   6. restore_faulty_page_host_permissions(): 快速恢复faulty页面的原始权限
+//   7. restore_orig_host_permissions(): 恢复所有沙箱页面的原始权限（模块卸载时使用）
+//
+// 页表遍历的关键挑战：
+//   - x86_64使用单一CR3寄存器，每次上下文切换都会改变pgd基址，因此每次调用get_pte()
+//     都需要从CR3重新读取pgd基址
+//   - ARM64使用TTBR0/TTBR1双寄存器，内核页表基址(TTBR1_EL1)在启动后不变，可安全缓存
+
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/vmalloc.h>
@@ -49,6 +67,13 @@ static pte_t_ *faulty_ptes = NULL;
 // symbols to modules, and the layout of `struct mm_struct` is not part of any
 // stable ABI either.
 // =================================================================================================
+// 【内核页表基址获取】
+// get_pte()需要知道内核顶层页表(pgd)的基址才能开始遍历。
+// 两种架构的处理方式不同：
+//   - ARM64: 内核页表基址(TTBR1_EL1)在系统启动后固定不变，可安全缓存
+//   - x86_64: 单一CR3寄存器在每次上下文切换时更新，不能缓存，必须每次从CR3读取
+// 注意：我们不使用kallsyms读取swapper_pg_dir等符号，因为CONFIG_KALLSYMS_ALL=n的内核
+// 不向模块暴露数据符号，且mm_struct布局不属于稳定ABI
 
 #if defined(ARCH_ARM)
 // On arm64 the CPU consults two separate registers for translation: TTBR0_EL1
@@ -56,6 +81,9 @@ static pte_t_ *faulty_ptes = NULL;
 // once at boot to point at `swapper_pg_dir`, a statically allocated page that
 // lives for the lifetime of the system and is never replaced on context switch
 // (only TTBR0_EL1 changes). So the value is stable and safe to cache.
+// 【ARM64页表基址】ARM64使用两个独立寄存器：TTBR0_EL1(用户空间)和TTBR1_EL1(内核空间)。
+// TTBR1_EL1在启动时设置为swapper_pg_dir，且上下文切换时不会改变（仅TTBR0改变），
+// 因此其值稳定可缓存。
 static pgd_t *arm64_kernel_pgd = NULL;
 
 static int init_kernel_pgd_base(void)
@@ -103,6 +131,11 @@ static inline pgd_t *get_kernel_pgd_base(void) { return arm64_kernel_pgd; }
 // Reading CR3 on every call sidesteps both: the kernel keeps the upper-half
 // (kernel/vmalloc) entries of every pgd synchronized, so walking whichever
 // pgd is live yields the correct PTE for a kernel VA regardless of context.
+// 【x86_64页表基址】x86_64只有CR3寄存器管理整个地址空间，每次上下文切换都会更新CR3。
+// 因此：1) 不能缓存pgd指针（insmod进程退出后指针悬空）；2) 不同进程有不同的pgd。
+// 解决方案：每次调用时从CR3读取当前pgd基址。内核保证所有进程的pgd中
+// 内核/vmalloc部分(上半部分)的条目是同步的，所以无论哪个进程的pgd，
+// 遍历结果都相同。
 static inline int init_kernel_pgd_base(void) { return 0; }
 
 static inline pgd_t *get_kernel_pgd_base(void) { return (pgd_t *)__va(read_cr3_pa()); }
@@ -124,24 +157,38 @@ static inline pgd_t *get_kernel_pgd_base(void) { return (pgd_t *)__va(read_cr3_p
 /// @return Pointer to the leaf PTE, or NULL if the address is out of range,
 ///         the pgd base is uninitialized, or the walk hits an unmapped or
 ///         malformed entry.
+// 【get_pte() - 内核页表遍历】这是整个页表管理系统的核心函数。
+// 功能：给定一个内核虚拟地址(HVA)，手动遍历4级(或5级)内核页表，返回其叶级PTE的指针。
+// 原理：x86_64页表结构为 PGD(PML4) -> P4D -> PUD(PDPT) -> PMD(PD) -> PTE(PT)，
+//       每级使用虚拟地址的不同位段作为索引查找下一级页表。
+// 关键特性：返回的指针直接指向活跃的页表项，写入该指针可直接修改映射，
+//           调用者需要负责TLB失效(native_page_invalidate)。
+// 限制：仅接受vmalloc或kmalloc(直接映射)范围内的地址；拒绝大页映射(1GiB/2MiB)。
 pte_t *get_pte(uint64_t hva)
 {
     pgd_t *pgd_base;
 
     // Make sure we are in vmalloc area
+    // 【地址合法性检查】确保目标地址在vmalloc或kmalloc(直接映射)范围内，
+    // 否则页表遍历可能产生错误结果或访问非法内存
     if (!is_vmalloc_addr((void *)hva) && !virt_addr_valid((void *)hva)) {
         PRINT_ERR("get_pte: address not in vmalloc or kmalloc area");
         return NULL;
     }
 
     pgd_base = get_kernel_pgd_base();
+    // 【获取页表基址】从CR3(x86_64)或TTBR1_EL1(ARM64)获取当前内核页表的顶层基址
     if (!pgd_base) {
         PRINT_ERR("get_pte: kernel pgd base not initialized");
         return NULL;
     }
 
     // Do a page walk
-    // - Level 0
+    // 【页表遍历过程】以下逐级遍历5级页表结构，每一级使用虚拟地址的对应位段作为索引
+    // x86_64 5级页表: PGD(L0) -> P4D(L1) -> PUD(L2) -> PMD(L3) -> PTE(L4)
+    // 每级页表包含512个条目(9位索引)，使用READ_ONCE确保原子读取
+    
+    // - Level 0: 页全局目录(PGD/PML4)，使用虚拟地址的[47:39]位作为索引
     pgd_t *pgdp = pgd_offset_pgd(pgd_base, hva);
     pgd_t pgd = READ_ONCE(*pgdp);
     if (pgd_none(pgd)) {
@@ -149,7 +196,7 @@ pte_t *get_pte(uint64_t hva)
         return NULL;
     }
 
-    // - Level 1
+    // - Level 1: P4D层（在5级页表中使用，4级页表中此层被跳过但内核API仍提供统一接口）
     p4d_t *p4dp = p4d_offset(pgdp, hva);
     p4d_t p4d = READ_ONCE(*p4dp);
     if (p4d_none(p4d)) {
@@ -157,7 +204,7 @@ pte_t *get_pte(uint64_t hva)
         return NULL;
     }
 
-    // - Level 2
+    // - Level 2: 页上层目录(PUD/PDPT)，使用虚拟地址的[38:30]位作为索引
     pud_t *pudp = pud_offset(p4dp, hva);
     pud_t pud = READ_ONCE(*pudp);
     if (pud_none(pud)) {
@@ -166,6 +213,8 @@ pte_t *get_pte(uint64_t hva)
     }
     // Reject huge (1 GiB) leaf mappings: descending past a block entry would
     // synthesize a bogus PMD pointer.
+    // 【拒绝1GiB大页映射】如果PUD是叶节点(1GiB大页)，则不能继续向下遍历，
+    // 因为大页条目中编码的是物理页帧地址而非下一级页表地址，继续遍历会产生虚假指针
     if (IS_PUD_LEAF(pud)) {
         PRINT_ERR("get_pte: pud is a huge (1 GiB) leaf mapping\n");
         return NULL;
@@ -175,7 +224,7 @@ pte_t *get_pte(uint64_t hva)
         return NULL;
     }
 
-    // - Level 3
+    // - Level 3: 页中间目录(PMD/PD)，使用虚拟地址的[29:21]位作为索引
     pmd_t *pmdp = pmd_offset(pudp, hva);
     pmd_t pmd = READ_ONCE(*pmdp);
     if (pmd_none(pmd)) {
@@ -183,6 +232,7 @@ pte_t *get_pte(uint64_t hva)
         return NULL;
     }
     // Reject large (2 MiB) leaf mappings.
+    // 【拒绝2MiB大页映射】与1GiB大页同理，2MiB大页(PMD叶节点)也不能继续向下遍历
     if (IS_PMD_LEAF(pmd)) {
         PRINT_ERR("get_pte: pmd is a large (2 MiB) leaf mapping\n");
         return NULL;
@@ -192,7 +242,9 @@ pte_t *get_pte(uint64_t hva)
         return NULL;
     }
 
-    // - Level 4 (leaf)
+    // - Level 4 (leaf): 页表条目(PTE)，使用虚拟地址的[20:12]位作为索引
+    // 【叶级PTE】这是最终目标，PTE中编码了物理页帧地址和权限位(Present/Writable/User/等)
+    // 返回的指针直接指向活跃的页表条目，后续可直接修改权限位
     pte_t *pte = pte_offset_kernel(pmdp, hva);
     ASSERT_ENULL(pte_present(*pte), "get_pte");
 
@@ -202,9 +254,22 @@ pte_t *get_pte(uint64_t hva)
 // =================================================================================================
 // Manipulation of Host Page Tables
 // =================================================================================================
+// 【宿主机页表操作】以下函数用于管理沙箱页面的宿主机PTE权限，是fuzzer构造侧信道条件的核心
+// 操作流程：缓存PTE指针 -> 保存原始权限 -> 修改权限 -> 恢复权限
+
 /// @brief Cache the PTE pointers for all sandbox pages.
 /// @param void
 /// @return 0 on success, -1 on failure
+// 【cache_host_pteps - 缓存PTE指针】
+// 作用：遍历所有沙箱页面的虚拟地址，调用get_pte()获取每个页面的PTE指针并缓存。
+// 为什么需要缓存？
+//   1. get_pte()需要5级页表遍历，开销较大，频繁调用会严重影响fuzzer性能
+//   2. 在fuzzer执行过程中需要快速修改PTE权限，缓存后可直接写入而不需要重新遍历
+//   3. 沙箱页面的虚拟地址在分配后固定不变，对应的PTE指针也不会改变
+// 缓存三类页面的PTE指针：
+//   - util_pteps: 工具页面（用于存储测量结果），所有actor共享
+//   - data_pteps: 数据页面，每个actor有独立的N_DATA_PAGES_PER_ACTOR个页面
+//   - code_pteps: 代码页面，每个actor有独立的N_CODE_PAGES_PER_ACTOR个页面
 int cache_host_pteps(void)
 {
     ASSERT(sandbox_pteps != NULL, "cache_host_pteps");
@@ -252,6 +317,11 @@ int cache_host_pteps(void)
 /// @brief Preserve the original PTEs for all sandbox pages.
 /// @param void
 /// @return 0 on success, -1 on failure
+// 【store_orig_host_permissions - 保存原始权限】
+// 作用：在修改沙箱页面权限之前，保存每个页面的原始PTE值。
+// 原因：fuzzer运行过程中会反复修改PTE权限位（如清除Present位、设置U/S位等），
+//       在fuzzer迭代结束或模块卸载时，必须恢复原始权限以避免破坏系统稳定性。
+// 同时为每个actor分配一个faulty_ptes条目，用于后续faulty页面权限的快速保存/恢复。
 int store_orig_host_permissions(void)
 {
     ASSERT(sandbox_pteps->util_pteps[0] != NULL, "store_orig_host_permissions");
@@ -295,6 +365,10 @@ int store_orig_host_permissions(void)
 /// @param ptep
 /// @param old_pte
 /// @param vaddr
+// 【restore_pte - 恢复单个页面的PTE】
+// 作用：将单个页面的PTE恢复为原始值，仅在PTE确实被修改时才执行恢复操作。
+// 如果当前PTE值与原始值不同，则写入原始值并刷新TLB(native_page_invalidate)。
+// TLB刷新是必要的，因为CPU可能缓存了旧的页表映射，如果不刷新会导致修改不生效。
 static void restore_pte(pte_t_ *ptep, pte_t_ old_pte, uint64_t vaddr)
 {
     uint64_t curr_pte_val = *(uint64_t *)ptep;
@@ -309,6 +383,10 @@ static void restore_pte(pte_t_ *ptep, pte_t_ old_pte, uint64_t vaddr)
 /// @brief Restore the original PTEs for all sandbox pages.
 /// @param void
 /// @return
+// 【restore_orig_host_permissions - 恢复所有原始权限】
+// 作用：遍历所有沙箱页面，将每个页面的PTE恢复为store_orig_host_permissions()保存的原始值。
+// 使用场景：fuzzer迭代结束时（需要恢复权限以便下一次迭代重新配置）、模块卸载时。
+// 恢复过程中自动刷新TLB，确保CPU使用更新后的映射。
 int restore_orig_host_permissions(void)
 {
     ASSERT(sandbox_pteps->util_pteps[0] != NULL, "restore_orig_host_permissions");
@@ -343,6 +421,13 @@ int restore_orig_host_permissions(void)
 /// user-type actors
 /// @param void
 /// @return 0 on success, -1 on failure
+// 【set_user_pages - 设置用户actor页面权限】
+// 作用：为用户态(user)actor所属的沙箱页面设置U/S(User/Supervisor)位，使其可从Ring 3访问。
+// 背景：沙箱页面最初由内核(vmalloc)分配，其PTE的U/S位默认为0（仅Supervisor可访问），
+//       但用户态actor在Ring 3执行，需要访问这些页面来存储测量结果和执行代码。
+// 实现方式：调用set_user_bit()设置PTE的U/S位为1，然后刷新TLB使修改生效。
+// 注意：仅修改PL_USER类型的actor的页面，跳过内核态(actor->pl != PL_USER)的actor。
+// util页面是所有actor共享的，始终设置U/S位，因为用户actor需要写入测量结果。
 int set_user_pages(void)
 {
     ASSERT(sandbox_pteps->util_pteps[0] != NULL, "restore_orig_host_permissions");
@@ -382,6 +467,18 @@ int set_user_pages(void)
 /// @brief Fast modification of the faulty page host PTE; sets the permissions according to
 /// actor_t->data_permissions
 /// @param void
+// 【set_faulty_page_host_permissions - 设置faulty页面权限】
+// 作用：快速修改每个actor的faulty数据页面的宿主机PTE权限位。
+// 这是fuzzer构造侧信道攻击条件的核心操作：
+//   - 每个actor有一个专门的faulty页面(FAULTY_PAGE_ID)，其权限在每次fuzzer迭代中动态修改
+//   - data_permissions编码了期望的权限位组合（如清除Present位触发#PF，清除Writable位等）
+//   - 使用mask_set和mask_clear实现快速位操作：mask_set指定要置1的位，mask_clear指定要置0的位
+// 实现细节：
+//   1. 先保存当前PTE值到faulty_ptes[]，用于后续恢复
+//   2. 从actor->data_permissions提取权限掩码
+//   3. MODIFIABLE_PTE_BITS定义了哪些PTE位可以被fuzzer修改（避免破坏关键位）
+//   4. 计算新PTE值: pte = (org_value | mask_set) & mask_clear
+//   5. 仅在PTE实际改变时才写入和刷新TLB（减少不必要的开销）
 void set_faulty_page_host_permissions(void)
 {
     for (int actor_id = 0; actor_id < n_actors; actor_id++) {
@@ -406,6 +503,11 @@ void set_faulty_page_host_permissions(void)
 
 /// @brief Fast recovery of original permissions of the faulty page host PTE
 /// @param void
+// 【restore_faulty_page_host_permissions - 恢复faulty页面权限】
+// 作用：快速恢复每个actor的faulty页面PTE为set_faulty_page_host_permissions()执行前的值。
+// 这是set_faulty_page_host_permissions()的逆操作，使用预先保存的faulty_ptes[]数组。
+// 在fuzzer每次迭代结束后调用，确保下一次迭代从原始权限开始重新配置。
+// 同样刷新TLB以确保恢复生效。
 void restore_faulty_page_host_permissions(void)
 {
     for (int actor_id = 0; actor_id < n_actors; actor_id++) {
@@ -421,6 +523,11 @@ void restore_faulty_page_host_permissions(void)
 /// module-load time rather than crashing inside get_pte() on the first
 /// sandbox allocation.
 /// @return 0 on success, negative errno on failure
+// 【self_test_page_walk - 页表遍历自测试】
+// 作用：在模块加载时验证get_pte()能否正确遍历内核页表。
+// 原因：如果内核pgd基址配置错误（如ARM64的TTBR1_EL1解码失败），get_pte()会在
+//       首次使用时崩溃。自测试在分配沙箱之前就发现并报告问题，避免更严重的后果。
+// 方法：分配一个vmalloc页面，调用get_pte()获取其PTE，验证页表遍历能正常工作。
 static int self_test_page_walk(void)
 {
     void *probe_va = vmalloc(PAGE_SIZE);
@@ -439,6 +546,8 @@ static int self_test_page_walk(void)
 
 int init_page_table_manager(void)
 {
+    // 【页表管理器初始化】
+    // 步骤：1. 初始化内核pgd基址(ARM64读取TTBR1_EL1) -> 2. 分配PTE保存/缓存结构 -> 3. 自测试
     int err = init_kernel_pgd_base();
     if (err)
         return err;
@@ -467,6 +576,8 @@ void free_page_table_manager(void)
 {
     // Tolerate partial initialization: init_page_table_manager() may have
     // failed mid-way, leaving some pointers NULL
+    // 【页表管理器释放】容许部分初始化失败的情况，仅释放非NULL指针。
+    // 初始化可能在任意步骤失败，此时部分指针为NULL，必须安全处理。
     if (sandbox_pteps) {
         SAFE_FREE(sandbox_pteps->data_pteps);
         SAFE_FREE(sandbox_pteps->code_pteps);

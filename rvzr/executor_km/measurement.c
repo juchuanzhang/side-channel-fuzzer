@@ -42,6 +42,11 @@ int run_experiment_outer(void); // inline asm label defined in <arch>/fault_hand
 // Local shortcut functions
 // =================================================================================================
 
+// 微架构状态刷新函数：清除CPU微架构层面的残留状态（如L1数据缓存、填充缓冲区、
+// 存储缓冲区等），确保每次测量执行前CPU处于一致的初始状态，防止前一次测试的
+// 微架构痕迹影响后续测量的硬件追踪结果，从而保证侧信道泄漏观测的可重复性和确定性。
+// Intel平台使用VERW指令刷新填充缓冲区、L1D_FLUSH MSR刷新L1数据缓存、WBINVD回写
+// 并失效缓存；AMD平台使用WBINVD和LFENCE组合刷新。
 /// @brief Flushes the microarchitectural state
 /// @param void
 /// @return 0 on success, -1 on failure
@@ -63,6 +68,10 @@ static inline int uarch_flush(void)
     return 0;
 }
 
+// 测试执行前的CPU环境准备函数：验证关键数据结构（测试用例入口、输入数据等）的有效性，
+// 配置性能计数器(PFC)用于硬件追踪收集，启用FPU以防测试用例使用浮点指令，
+// 绑定CPU核心(get_cpu)防止调度迁移，禁用本地中断(raw_local_irq_save)确保测量期间
+// 无外部干扰——这些操作为测量创造一个尽可能隔离和确定性的执行环境。
 /// @brief Check if entry page of the test case is valid (present and executable)
 /// @param void
 /// @return 0 if the entry page is valid, -1 otherwise
@@ -149,6 +158,10 @@ static int pre_run(unsigned long *irq_flags)
     return err;
 }
 
+// 测试执行后的CPU环境恢复函数：与pre_run配对，恢复被修改的CPU状态——
+// AMD平台重新启用全局中断(STGI)，恢复本地中断状态(raw_local_irq_restore)，
+// 释放CPU核心绑定(put_cpu)，关闭FPU使用权限(kernel_fpu_end)，
+// 确保测量完成后系统回归正常运行状态。
 /// @brief Cleanup after the test case execution by undoing the changes made in pre_run
 /// @param irq_flags The flags to restore the interrupt state
 /// @return void
@@ -170,6 +183,12 @@ static inline void post_run(unsigned long *irq_flags)
 // =================================================================================================
 // CPU state management
 // =================================================================================================
+// 执行环境配置函数（对应论文Figure 4算法步骤）：首先通过set_special_registers
+// 配置系统寄存器（如CR3页表基址、CR4控制位等）为测试所需的特殊值；若测试用例
+// 涉及虚拟机操作(includes_vm_actors)，则根据CPU厂商(Intel/AMD)启动虚拟化扩展
+// (VMX/SVM)，保存宿主机原始虚拟机状态(store_orig_vmcs_state/store_orig_vmcb_state)，
+// 并配置虚拟机控制结构(VMCS/VMCB)为测试所需的参数(set_vmcs_state/set_vmcb_state)。
+// 这些步骤对应论文中"配置系统寄存器"和"创建虚拟机"两个关键环节。
 /// @brief Stores the current state of the CPU and re-configures it for the test case execution
 /// @param void
 /// @return 0 on success, -1 on failure
@@ -206,6 +225,13 @@ static int set_execution_environment(void)
     return 0;
 }
 
+// 原始状态恢复函数（故障安全方式）：该函数以故障安全(fail-safe)方式编写，
+// 可在故障处理程序中安全调用，确保即使测试用例触发异常或故障也能完整回滚。
+// 恢复顺序：1) 若启用了虚拟化，恢复宿主机原始VMCS/VMCB状态并停止虚拟化操作
+// (VMX/SVM)；2) 恢复被修改的故障页权限(restore_faulty_page_permissions)；
+// 3) 恢复特殊系统寄存器到原始值(restore_special_registers)；
+// 4) 恢复原始沙箱页表(restore_orig_sandbox_page_tables)——
+// 防止内核状态因测量执行而永久损坏，是论文中"故障安全恢复"策略的核心实现。
 /// @brief Restores the CPU state to the state before the test case execution. This function is
 /// written in a fail-safe manner, so that it can be called in fault handlers.
 /// @param void
@@ -237,6 +263,17 @@ void recover_orig_state(void)
 // Measurement loop: trace_test_case -> run_experiment_outer -> run_experiment
 // =================================================================================================
 
+// 核心测量循环函数（对应论文中的测量执行流程）：完整执行一次测量实验，步骤如下：
+// 1) 创建沙箱页表(set_sandbox_page_tables)——对应论文"创建页表"；
+// 2) 配置执行环境(set_execution_environment)——对应论文"配置系统寄存器/创建虚拟机"；
+// 3) 初始化Prime+Probe探测区域并可选刷新微架构状态(uarch_flush)——对应论文
+//    "刷新缓存和缓冲区"；
+// 4) 进入测量循环：对每个输入执行测试用例，包括加载沙箱数据、设置故障页权限、
+//    设置故障处理程序、执行测试用例、收集硬件追踪和PFC读数、后处理测量结果
+//    （检测SMI干扰等导致的测量损坏，有效测量标记最高位以区分）——对应论文
+//    "循环执行测试用例并收集硬件追踪"；
+// 5) 清理阶段调用recover_orig_state恢复系统。
+// 前uarch_reset_rounds次为预热运行(i<0)，不计入正式测量结果。
 /// @brief Run a complete measurement experiment: setup the execution environment and execute
 ///        the loaded test case for each inputs, storing the resulting hardware traces and PFC
 ///        readings in the global `measurements` array
@@ -317,6 +354,13 @@ cleanup:
     return err;
 }
 
+// 最外层测量入口函数：作为测量的最外层包装，负责：
+// 1) 分配测量结果存储空间(alloc_measurements)；
+// 2) 调用pre_run准备CPU环境并禁用中断——对应论文"禁用中断/保存宿主机状态"；
+// 3) 若有输入数据则调用run_experiment_outer进入测量核心循环；
+// 4) 调用post_run恢复CPU状态和中断。
+// 该函数与run_experiment_outer（内联汇编定义在<arch>/fault_handler.c中）共同构成了
+// 论文Figure 4描述的完整高层算法的入口点。
 /// @brief The outermost wrapper for the test case execution. Sets up performance counters,
 ///        configures the CPU, disables interrupts, and calls enter_unsafe_bubble
 /// @param void
