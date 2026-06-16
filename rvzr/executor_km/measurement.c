@@ -31,7 +31,7 @@
 #include "svm.h"
 #include "vmx.h"
 #elif defined(ARCH_ARM)
-
+#include "vm.h"
 #endif
 
 measurement_t *measurements = NULL; // global
@@ -63,7 +63,22 @@ static inline int uarch_flush(void)
 #elif VENDOR_ID == VENDOR_AMD_ // AMD
     asm volatile("wbinvd\n" : : :);
     asm volatile("lfence\n" : : :);
-    // TBD
+#elif VENDOR_ID == VENDOR_ARM_ // ARM64
+    // ARM64微架构状态刷新：
+    // 1. DC CISW - 清除并无效L1数据缓存（按set/way方式）
+    // 2. IC IALLUIS - 无效所有Inner Shareable指令缓存
+    // 3. TLBI VMALLE1IS - 无效所有Stage-1 TLB（Inner Shareable）
+    // 4. DSB + ISB - 数据同步屏障 + 指令同步屏障
+    // Cortex A72/A76的DC CISW操作需要先通过CSSELR_EL1选择L1D缓存级别
+    asm volatile(
+        "msr csselr_el1, xzr\n"       // 选择L1D缓存(CSSELR=0)
+        "isb\n"
+        "dc cisw, xzr\n"               // 清除并无效L1D缓存(方式0,集合0)
+        "ic ialluis\n"                  // 无效所有Inner Shareable ICache
+        "tlbi vmalle1is\n"             // 无效所有Stage-1 TLB
+        "dsb ish\n"                    // 数据同步屏障(Inner Shareable)
+        "isb\n"                        // 指令同步屏障
+        : : : "memory");
 #endif
     return 0;
 }
@@ -146,6 +161,10 @@ static int pre_run(unsigned long *irq_flags)
     // Enable FPU - just in case, we might use it within the test case
 #ifdef ARCH_X86_64
     kernel_fpu_begin();
+#elif defined(ARCH_ARM)
+    // ARM64: FP/NEON默认在内核中已启用（由kernel_neon_begin管理）
+    // 但侧信道测试需要在EL0/EL1直接使用FP寄存器，此处不做特殊处理
+    // FP访问权限由CPACR_EL1.FPEN控制，在set_special_registers中配置
 #endif
 
     // Prevent preemption
@@ -177,6 +196,8 @@ static inline void post_run(unsigned long *irq_flags)
 
 #ifdef ARCH_X86_64
     kernel_fpu_end();
+#elif defined(ARCH_ARM)
+    // ARM64: 无需手动关闭FPU，CPACR_EL1在restore_special_registers中恢复
 #endif
 }
 
@@ -198,9 +219,8 @@ static int set_execution_environment(void)
     err = set_special_registers();
     CHECK_ERR("set_execution_environment:set_special_registers");
 
-    // If necessary, enable VM operation
-#ifdef ARCH_X86_64
     if (test_case->features.includes_vm_actors) {
+#ifdef ARCH_X86_64
         if (cpuinfo->x86_vendor == X86_VENDOR_INTEL) {
             err = start_vmx_operation();
             CHECK_ERR("set_execution_environment:start_vmx_operation");
@@ -220,8 +240,17 @@ static int set_execution_environment(void)
             err = set_vmcb_state();
             CHECK_ERR("set_execution_environment:set_vmcb_state");
         }
-    }
+#elif defined(ARCH_ARM)
+        err = start_vm_operation();
+        CHECK_ERR("set_execution_environment:start_vm_operation");
+
+        err = store_orig_vm_state();
+        CHECK_ERR("set_execution_environment:store_orig_vm_state");
+
+        err = set_vm_state();
+        CHECK_ERR("set_execution_environment:set_vm_state");
 #endif
+    }
     return 0;
 }
 
@@ -237,20 +266,20 @@ static int set_execution_environment(void)
 /// @param void
 void recover_orig_state(void)
 {
-    // restore VMX state
 #ifdef ARCH_X86_64
     if (test_case->features.includes_vm_actors) {
         if (cpuinfo->x86_vendor == X86_VENDOR_INTEL) {
-            // if (vmx_is_on)
-            //     print_vmx_exit_info(); // uncomment to debug VMX exits
             restore_orig_vmcs_state();
             stop_vmx_operation();
         } else if (cpuinfo->x86_vendor == X86_VENDOR_AMD) {
-            // if (svm_is_on)
-            //     print_svm_exit_info(); // uncomment to debug SVM exits
             restore_orig_vmcb_state();
             stop_svm_operation();
         }
+    }
+#elif defined(ARCH_ARM)
+    if (test_case->features.includes_vm_actors) {
+        restore_orig_vm_state();
+        stop_vm_operation();
     }
 #endif
 

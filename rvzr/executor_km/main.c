@@ -71,7 +71,11 @@
 
 // 【ISA架构特定头文件】根据目标CPU架构引入虚拟化支持：
 // x86_64架构：svm.h（AMD SVM虚拟化）、vmx.h（Intel VMX虚拟化）
-// ARM架构：内核CPU特性检测头文件
+// ARM架构：vm.h（ARM64 EL2虚拟化管理）
+#ifdef ARCH_ARM
+#include "vm.h"
+#endif
+
 #if defined(ARCH_X86_64)
 
 // =================================================================================================
@@ -315,7 +319,6 @@ static int check_test_case_compat(void)
 #ifdef ARCH_X86_64
     if (test_case->features.includes_user_actors) {
 #ifndef FORCE_SMAP_OFF
-        // ensure that SMAP and SMEP are disabled
         uint64_t cr4 = __read_cr4();
         ASSERT(!(__read_cr4() & (X86_CR4_SMAP | X86_CR4_SMEP)), "test_case_store");
 #endif
@@ -326,6 +329,11 @@ static int check_test_case_compat(void)
         } else if (cpuinfo->x86_vendor == X86_VENDOR_AMD) {
             err = svm_check_cpu_compatibility();
         }
+        CHECK_ERR("vm_check_cpu_compatibility");
+    }
+#elif defined(ARCH_ARM)
+    if (test_case->features.includes_vm_actors) {
+        err = vm_check_cpu_compatibility();
         CHECK_ERR("vm_check_cpu_compatibility");
     }
 #endif
@@ -801,6 +809,8 @@ static int __init executor_init(void)
     err |= init_vmx();
 #elif VENDOR_ID == VENDOR_AMD_
     err |= init_svm();
+#elif VENDOR_ID == VENDOR_ARM_
+    err |= init_vm();
 #endif
     CHECK_ERR("executor_init");
 
@@ -883,6 +893,8 @@ static void __exit executor_exit(void)
     free_vmx();
 #elif VENDOR_ID == VENDOR_AMD_
     free_svm();
+#elif VENDOR_ID == VENDOR_ARM_
+    free_vm();
 #endif
 
 #if defined(ARCH_ARM)
