@@ -1,0 +1,9 @@
+file: !include arch.yaml
+
+actors:
+  - actor2:
+      - mode: "host"
+      - privilege_level: "user"
+  - actor3:
+      - mode: "host"
+      - privilege_level: "user"

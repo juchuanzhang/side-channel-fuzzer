@@ -1,0 +1,7 @@
+file: !include arch.yaml
+
+actors:
+  - actor2:
+      - mode: "guest"
+  - actor3:
+      - mode: "guest"
