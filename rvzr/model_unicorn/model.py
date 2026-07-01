@@ -1,5 +1,18 @@
 """
-File: Unicorn-based backend to the contract model.
+文件：基于 Unicorn 的合约模型后端实现。
+
+本模块实现了微架构侧信道模糊测试框架的核心模型，使用 Unicorn CPU 模拟器引擎
+来模拟推测执行行为。模型通过状态机方式管理执行流程，支持：
+- 顺序执行和推测执行两种模式
+- x86-64 和 ARM64 两种架构
+- 故障处理、权限检查和回滚机制
+- 污点追踪、覆盖率统计和合约轨迹收集
+
+核心类：
+- _Dispatcher: 调度器，将 Unicorn 事件分发到各服务模块
+- UnicornModel: 架构无关的模型基类（抽象类）
+- X86UnicornModel: x86-64 架构的模型实现
+- ARM64UnicornModel: ARM64 架构的模型实现
 
 Copyright (C) Microsoft Corporation
 SPDX-License-Identifier: MIT
@@ -39,24 +52,33 @@ if TYPE_CHECKING:
     from ..sandbox import BaseAddrTuple
 
 
-_UC_FAULT_MAPPING: Final[Dict[str, List[int]]] = {  # map fault names to Unicorn fault IDs
-    "DE": [21],
-    "DB": [10],
-    "BP": [21],
-    "BR": [13],
-    "UD": [10],
-    "PF": [12, 13],
-    "GP": [6, 7],
-    "assist": [12, 13],
+_UC_FAULT_MAPPING: Final[Dict[str, List[int]]] = {  # 故障名称到 Unicorn 故障 ID 的映射
+    "DE": [21],    # 除法错误 (Division Error)
+    "DB": [10],    # 调试异常 (Debug Exception)
+    "BP": [21],    # 断点 (Breakpoint)
+    "BR": [13],    # 范围超出 (Bound Range)
+    "UD": [10],    # 未定义指令 (Undefined Instruction)
+    "PF": [12, 13], # 页故障 (Page Fault) - 12 为读取, 13 为写入
+    "GP": [6, 7],  # 一般保护故障 (General Protection) - 6 为非规范, 7 为其他
+    "assist": [12, 13], # 微代码辅助 (Microcode Assist)
 }
 
 
 # ==================================================================================================
-# Private classes and functions
+# 私有类和函数
 # ==================================================================================================
 class _Dispatcher:
     """
-    Class responsible for invoking callback functions in service classes upon events in Unicorn
+    调度器类：负责在 Unicorn 中发生事件时调用各服务模块的回调函数。
+
+    调度器协调以下服务模块：
+    - taint_tracker: 污点追踪器
+    - tracer: 执行追踪器
+    - speculator: 推测器
+    - interpreter: 额外解释器
+    - coverage: 覆盖率统计
+
+    各回调的调用顺序是重要的，因为某些模块依赖于其他模块的先处理结果。
     """
     coverage: InstructionCoverage
     _taint_tracker: UnicornTaintTracker
@@ -67,6 +89,9 @@ class _Dispatcher:
     def __init__(self, taint_tracker: UnicornTaintTracker, speculator: UnicornSpeculator,
                  tracer: UnicornTracer, interpreter: ExtraInterpreter,
                  coverage: InstructionCoverage) -> None:
+        """
+        初始化调度器，建立与各服务模块的连接。
+        """
         self._taint_tracker = taint_tracker
         self._tracer = tracer
         self._speculator = speculator
@@ -74,14 +99,16 @@ class _Dispatcher:
         self.coverage = coverage
 
     def test_case_load_dispatch(self, test_case: TestCaseProgram) -> None:
-        """ Call callbacks in service classes that need to be called when a test case is loaded """
+        """ 在加载测试用例时调用各服务模块的回调。
+        通知解释器和追踪器加载测试用例，并管理覆盖率的测试用例边界。 """
         self._interpreter.load_test_case(test_case)
         self._tracer.load_test_case(test_case)
         self.coverage.finish_test_case()
         self.coverage.start_test_case()
 
     def execution_start_dispatch(self, input_: InputData) -> None:
-        """ Call callbacks in service classes that need to be called before model execution """
+        """ 在模型执行开始前调用各服务模块的回调。
+        重置追踪器、推测器和污点追踪器，加载输入到解释器。 """
         self._tracer.reset(input_)
         self._speculator.reset()
         self._taint_tracker.reset()
@@ -89,13 +116,25 @@ class _Dispatcher:
 
     def instruction_dispatch(self, address: int, size: int, _: UnicornModel,
                              state: ModelExecutionState) -> None:
-        """ Call instruction-related callbacks in service classes """
+        """ 在每条指令执行时调用各服务模块的回调。
+
+        调用顺序（重要）：
+        1. 污点追踪器：追踪指令操作数
+        2. 追踪器：记录指令事件
+        3. 推测器：处理推测机制
+        4. 解释器：额外解释逻辑
+        5. 覆盖率：记录指令覆盖
+
+        :param address: 指令地址
+        :param size: 指令大小
+        :param state: 模型执行状态
+        """
 
         if state.current_instruction.is_macro_placeholder:
-            # Skip macro placeholders as they are not real instructions
+            # 跳过宏占位符，它们不是真正的指令
             return
 
-        # NOTE: the order of the following calls is important
+        # 注意：以下调用顺序是重要的
         self._taint_tracker.track_instruction(state.current_instruction)
         self._tracer.observe_instruction(address, size)
         self._speculator.handle_instruction(address, size)
@@ -104,13 +143,26 @@ class _Dispatcher:
 
     def mem_access_dispatch(self, access: int, address: int, size: int, value: int,
                             state: ModelExecutionState) -> None:
-        """ Call memory access-related callbacks in service classes """
+        """ 在每次内存访问时调用各服务模块的回调。
+
+        调用顺序（重要）：
+        1. 污点追踪器：追踪内存访问操作数
+        2. 推测器：处理内存访问级推测机制
+        3. 追踪器：记录内存访问事件
+        4. 解释器：额外解释逻辑（如故障权限检查）
+
+        :param access: 内存访问类型
+        :param address: 内存地址
+        :param size: 访问大小
+        :param value: 访问的值
+        :param state: 模型执行状态
+        """
 
         if state.current_instruction.is_macro_placeholder:
-            # Skip macro placeholders as they are not real instructions
+            # 跳过宏占位符
             return
 
-        # NOTE: the order of the following calls is important
+        # 注意：以下调用顺序是重要的
         self._taint_tracker.track_memory_access(address, size, access == UC_MEM_WRITE)
         self._speculator.handle_mem_access(access, address, size, value)
         self._tracer.observe_mem_access(access, address, size, value)
@@ -118,23 +170,24 @@ class _Dispatcher:
 
 
 def _instruction_hook(_: Uc, address: int, size: int, model: UnicornModel) -> None:
-    """ Dispatch the Unicorn instruction hook to the model. """
+    """ 将 Unicorn 指令钩子分发到模型。 """
     model.instruction_callback(address, size)
 
 
 def _mem_access_hook(_: Uc, access: int, address: int, size: int, value: int,
                      model: UnicornModel) -> None:
-    """ Dispatch the Unicorn memory access hook to the model. """
+    """ 将 Unicorn 内存访问钩子分发到模型。 """
     model.mem_access_callback(access, address, size, value)
 
 
 def _mem_unmapped_hook(_: Uc, access: int, address: int, size: int, value: int,
                        model: UnicornModel) -> None:
-    """ Dispatch the Unicorn memory unmapped hook to the model. """
+    """ 将 Unicorn 未映射内存访问钩子分发到模型。 """
     model.mem_access_callback(access, address, size, value)
 
 
 _ERR_DECODE = {
+    """ Unicorn 错误码到描述字符串的映射 """
     uc.UC_ERR_OK: "OK (UC_ERR_OK)",
     uc.UC_ERR_NOMEM: "No memory available or memory not present (UC_ERR_NOMEM)",
     uc.UC_ERR_ARCH: "Invalid/unsupported architecture (UC_ERR_ARCH)",
@@ -160,45 +213,72 @@ _ERR_DECODE = {
 
 
 def _err_to_str(errno: int) -> str:
+    """ 将 Unicorn 错误码转换为描述字符串。
+    :param errno: Unicorn 错误码
+    :return: 错误描述字符串
+    """
     if errno in _ERR_DECODE:
         return _ERR_DECODE[errno]
     return "Unknown error code"
 
 
 # ==================================================================================================
-# Public Interface: Architecture-independent Model
+# 公共接口：架构无关模型
 # ==================================================================================================
 class UnicornModel(Model, ABC):
     """
-    Basic architecture-independent implementation of a Unicorn-based model.
-    This implementation does not support speculative execution; see UnicornSpec for that.
+    基于 Unicorn 的架构无关模型基础实现。
+
+    该模型管理 CPU 模拟器的执行流程，通过状态机方式处理正常执行、
+    故障处理和推测执行回滚等场景。它作为协调者连接多个服务模块：
+    - 推测器(speculator): 控制推测执行行为
+    - 追踪器(tracer): 收集合约轨迹
+    - 污点追踪器(taint_tracker): 追踪数据依赖
+    - 解释器(interpreter): 提供额外的指令解释逻辑
+    - 覆盖率(coverage): 统计指令覆盖率
+
+    该基类不直接支持推测执行；推测行为由推测器子类实现。
+
+    完整的状态机图见：docs/assets/unicorn-model-state-machine.drawio.png
     """
 
     # pylint: disable=too-many-instance-attributes
-    # This is a management class that connects many services together, so having many attributes
-    # is a necessary evil
+    # 这是一个管理类，连接多个服务模块，因此有许多属性是必要的
 
-    # Service objects
+    # 服务对象
     emulator: Uc
+    """ Unicorn 模拟器实例 """
     tracer: Final[UnicornTracer]
+    """ 执行追踪器 """
     speculator: Final[UnicornSpeculator]
+    """ 推测器 """
     _taint_tracker: UnicornTaintTracker
+    """ 污点追踪器 """
     _log: Final[ModelLogger]
+    """ 模型日志记录器 """
     _dispatcher: Final[_Dispatcher]
+    """ 事件调度器 """
 
-    # Model state
+    # 模型状态
     state: ModelExecutionState
+    """ 当前执行状态 """
     layout: SandboxLayout
+    """ 沙箱内存布局 """
 
-    # Descriptors
+    # 描述符
     _bases: BaseAddrTuple
+    """ 沙箱基地址元组 """
     _target_desc: Final[TargetDesc]
+    """ 目标架构描述 """
     _uc_target_desc: Final[UnicornTargetDesc]
+    """ Unicorn 特定的目标架构描述 """
     _architecture: Optional[Tuple[int, int]] = None  # (UC_ARCH, UC_MODE)
-    _handled_faults: Set[int]  # The set of fault types that do NOT terminate execution
+    """ Unicorn 架构和模式配置 """
+    _handled_faults: Set[int]
+    """ 不终止执行的故障类型集合 """
 
     # ----------------------------------------------------------------------------------------------
-    # Constructor and Service Module Initialization
+    # 构造函数和服务模块初始化
     def __init__(self,
                  bases: BaseAddrTuple,
                  target_desc: TargetDesc,
@@ -206,11 +286,21 @@ class UnicornModel(Model, ABC):
                  tracer_cls: Type[UnicornTracer],
                  interpreter_cls: Type[ExtraInterpreter],
                  enable_mismatch_check_mode: bool = False) -> None:
+        """
+        初始化 Unicorn 模型及其服务模块。
+
+        :param bases: 沙箱基地址元组
+        :param target_desc: 目标架构描述
+        :param speculator_cls: 推测器类
+        :param tracer_cls: 追踪器类
+        :param interpreter_cls: 额外解释器类
+        :param enable_mismatch_check_mode: 是否启用不匹配检查模式（用于调试）
+        """
 
         assert self._architecture is not None, \
             "Subclasses must define the `architecture` attribute before calling super().__init__"
 
-        # Service modules
+        # 初始化服务模块
         self.emulator = Uc(*self._architecture)
         self._taint_tracker = UnicornTaintTracker(bases, target_desc)
         self.tracer = tracer_cls(target_desc, self, self._taint_tracker)
@@ -221,12 +311,12 @@ class UnicornModel(Model, ABC):
         self._uc_target_desc = target_desc.uc_target_desc
         self._log = ModelLogger()
 
-        # Set the base addresses and the mismatch check mode
+        # 设置基地址和不匹配检查模式
         self._bases = bases
         self._enable_mismatch_check_mode = enable_mismatch_check_mode
         self.is_speculative = not self.speculator.is_sequential
 
-        # Set the list of handled faults
+        # 设置处理的故障类型列表（这些故障不终止执行）
         self._handled_faults = set()
         for fault in CONF._handled_faults:
             if fault in _UC_FAULT_MAPPING:
@@ -235,33 +325,41 @@ class UnicornModel(Model, ABC):
                 raise NotImplementedError(f"Fault type {fault} is not supported")
 
     # ----------------------------------------------------------------------------------------------
-    # Default Public Interface
+    # 默认公共接口
     def load_test_case(self, test_case: TestCaseProgram) -> None:
         """
-        Load the test case into the model. This method must be called before tracing
-        the test case (trace_test_case or trace_test_case_with_taints).
-        :param test_case: the test case to load
+        加载测试用例到模型。必须在追踪测试用例之前调用。
+
+        步骤：
+        1. 计算沙箱布局
+        2. 创建执行状态
+        3. 通知各服务模块加载测试用例
+        4. 创建新的 Unicorn 模拟器实例
+        5. 将测试用例二进制代码写入模拟器内存
+        6. 设置内存访问和指令执行钩子
+
+        :param test_case: 要加载的测试用例
         :return: None
-        :raises UcError: if an error occurs while loading the test case
+        :raises UcError: 如果加载过程中发生错误
         """
         test_case_obj = test_case.get_obj()
 
-        # Load the test case into the service classes
+        # 通知各服务模块加载测试用例
         self.layout = SandboxLayout(self._bases, test_case.n_actors())
         self._log.set_model_layout(self.layout)
         self.state = ModelExecutionState(test_case, self.layout, self._target_desc)
         self._dispatcher.test_case_load_dispatch(test_case)
 
-        # Create a new instance of the emulator
+        # 创建新的模拟器实例（每次加载测试用例都需要重建）
         assert self._architecture is not None, "_architecture must be set by subclass"
         self.emulator = Uc(*self._architecture)
 
-        # Get binary representation of the test case
+        # 获取测试用例的二进制表示
         code = test_case_obj.to_bytes(
             padded_section_size=self.layout.code_size_per_actor(), padding_byte=b'\x90')
 
-        # Allocate memory and write the binary
-        # Note: the data will be written later, by the _load_input method
+        # 分配内存并写入二进制代码
+        # 注意：数据将在 _load_input 方法中写入
         try:
             self.emulator.mem_map(self.layout.code_start(), self.layout.code_size)
             self.emulator.mem_map(self.layout.data_start(), self.layout.data_size)
@@ -269,7 +367,7 @@ class UnicornModel(Model, ABC):
         except UcError as e:
             error(f"[UnicornModel:load_test_case] {e}")
 
-        # Set up callbacks
+        # 设置回调钩子（指令执行、内存访问、未映射内存）
         try:
             self.emulator.hook_add(UC_HOOK_MEM_READ | UC_HOOK_MEM_WRITE, _mem_access_hook, self)
             self.emulator.hook_add(UC_HOOK_MEM_UNMAPPED, _mem_unmapped_hook, self)
@@ -279,10 +377,11 @@ class UnicornModel(Model, ABC):
 
     def trace_test_case(self, inputs: List[InputData], nesting: int) -> List[CTrace]:
         """
-        Execute the previously loaded test case with the inputs and collect the contract traces.
-        :param inputs: the inputs to use for the test case
-        :param nesting: the maximum number of speculative levels that will be simulated
-        :return: list of collected contract traces, one per input
+        使用给定输入执行测试用例并收集合约轨迹（不启用污点追踪）。
+
+        :param inputs: 用于测试用例的输入列表
+        :param nesting: 推测执行的最大嵌套层级
+        :return: 收集的合约轨迹列表，每个输入对应一条轨迹
         """
         self._taint_tracker.set_enable_tracking(False)
         self.speculator.set_max_nesting(nesting)
@@ -292,11 +391,11 @@ class UnicornModel(Model, ABC):
     def trace_test_case_with_taints(self, inputs: List[InputData],
                                     nesting: int) -> Tuple[List[CTrace], List[InputTaint]]:
         """
-        Executes the previously loaded test case with the inputs and collects the contract traces
-        while also tracking taints.
-        :param inputs: the inputs to use for the test case
-        :param nesting: the maximum number of speculative levels that will be simulated
-        :return: list of collected contract traces and the taints, one of each per input
+        使用给定输入执行测试用例，同时收集合约轨迹和污点信息。
+
+        :param inputs: 用于测试用例的输入列表
+        :param nesting: 推测执行的最大嵌套层级
+        :return: 合约轨迹列表和污点列表，每个输入各一条
         """
         self._taint_tracker.set_enable_tracking(True)
         self.speculator.set_max_nesting(nesting)
@@ -304,29 +403,40 @@ class UnicornModel(Model, ABC):
         return ctraces, taints
 
     # ----------------------------------------------------------------------------------------------
-    # Unicorn-specific Public Interface
+    # Unicorn 特定的公共接口
     def instruction_callback(self, address: int, size: int) -> None:
         """
-        Callback function called when Unicorn executes an instruction
-        :param address: the address of the instruction
-        :param size: the size of the instruction
+        Unicorn 执行指令时的回调函数。
+
+        处理逻辑：
+        1. 如果到达退出指令地址，停止模拟器
+        2. 否则，更新执行上下文（保存 Unicorn 状态，更新当前指令引用）
+        3. 将事件分发到各服务模块
+
+        :param address: 指令地址
+        :param size: 指令大小
         :return: None
         """
-        # Terminate execution if the exit instruction is reached
+        # 如果到达退出指令，终止执行
         if self.state.is_exit_addr(address):
             self.emulator.emu_stop()
             return
 
-        # Otherwise, update the context ...
+        # 更新上下文（保存 Unicorn 上下文用于 bug 修补，更新当前指令）
         self.state.update_context(self.emulator, address)
         self._log.dbg_instruction(address, self, self.state, self.speculator)
 
-        # .. and pass the instruction down to the service modules
+        # 将指令事件分发到各服务模块
         self._dispatcher.instruction_dispatch(address, size, self, self.state)
 
     def mem_access_callback(self, access: int, address: int, size: int, value: int) -> None:
         """
-        Callback function called when Unicorn accesses memory.
+        Unicorn 访问内存时的回调函数。
+
+        :param access: 内存访问类型
+        :param address: 内存地址
+        :param size: 访问大小
+        :param value: 访问的值
         """
         self._log.dbg_mem_access(access == UC_HOOK_MEM_WRITE, value, address, size, self,
                                  self.layout)
@@ -334,15 +444,30 @@ class UnicornModel(Model, ABC):
 
     def do_soft_fault(self, errno: int) -> None:
         """
-        Signal a fault to the model and stop the emulator
-        (without rising an exception in the emulator)
+        向模型发出故障信号并停止模拟器（不抛出异常）。
+
+        这是一种"软故障"机制：通过设置 pending_fault 标志和停止模拟器，
+        让 _run_state_machine 方法在模拟器停止后处理故障。
+        不抛出异常，避免了 Unicorn 内部的错误处理问题。
+
+        :param errno: 故障的错误号
         """
         assert self.state, "Function called before load_test_case"
         self.state.pending_fault = errno
         self.emulator.emu_stop()
 
     def set_faulty_area_rw(self, actor_id: int, r: bool, w: bool) -> None:
-        """ Sets the 'readable' and 'writable' property of the faulty area for the given actor """
+        """ 设置给定 actor 的故障区域的读写权限属性。
+
+        通过修改 Unicorn 的内存保护来模拟页表权限：
+        - 不可读和不可写: UC_PROT_NONE
+        - 可读但不可写: UC_PROT_READ
+        - 可读和可写: 默认权限
+
+        :param actor_id: actor 的 ID（-1 表示当前 actor）
+        :param r: 是否可读
+        :param w: 是否可写
+        """
         if actor_id == -1:
             actor_id = self.state.current_actor.get_id()
         faulty_base = self.layout.get_data_addr(DataArea.FAULTY, actor_id)
@@ -355,22 +480,34 @@ class UnicornModel(Model, ABC):
             self.emulator.mem_protect(faulty_base, faulty_size)
 
     def report_coverage(self, path: str) -> None:
-        """ Write the coverage data to a file """
+        """ 将覆盖率数据写入文件。
+        :param path: 输出文件路径
+        """
         self._dispatcher.coverage.report(path)
 
     @abstractmethod
     def print_registers(self, oneline: bool = False) -> None:
-        """ Print the current values of all general-purpose registers """
+        """ 打印所有通用寄存器的当前值（抽象方法，由架构子类实现）。 """
 
     # ----------------------------------------------------------------------------------------------
-    # Private Methods
+    # 私有方法
     def _execute_test_case_with_inputs(
             self, inputs: List[InputData]) -> Tuple[List[CTrace], List[InputTaint]]:
         """
-        Execute the loaded test case with the given sequence of inputs
-        and collect traces and taints.
-        :param inputs: the inputs to use for the test case
-        :return: the collected traces and taints
+        使用给定输入序列执行加载的测试用例，收集轨迹和污点。
+
+        对每个输入：
+        1. 重置模型状态和服务模块
+        2. 加载输入数据到模拟器
+        3. 运行状态机
+        4. 收集合约轨迹和污点信息
+
+        不匹配检查模式：
+        - 正常模式：存储合约轨迹
+        - 不匹配检查模式：存储寄存器值作为轨迹（用于验证模型与实际执行的一致性）
+
+        :param inputs: 输入数据列表
+        :return: 收集的轨迹和污点
         """
         traces, taints = [], []
         for index, input_ in enumerate(inputs):
@@ -378,21 +515,21 @@ class UnicornModel(Model, ABC):
             self.state.full_reset()
             self._dispatcher.execution_start_dispatch(input_)
 
-            # Execute the test case with the given input
+            # 使用给定输入执行测试用例
             self._load_input(input_)
             self._run_state_machine()
 
-            # Record traces (two options possible):
-            if not self._enable_mismatch_check_mode:  # Case 1: normal mode - store traces
+            # 记录轨迹（两种选项）：
+            if not self._enable_mismatch_check_mode:  # 选项1：正常模式 - 存储轨迹
                 traces.append(self.tracer.get_trace())
-            else:  # Case 2: mismatch check mode - store register values
+            else:  # 选项2：不匹配检查模式 - 存储寄存器值
                 register_list = self._uc_target_desc.usable_registers
-                registers = register_list[:-2]  # exclude RSP and EFLAGS
+                registers = register_list[:-2]  # 排除 RSP 和 EFLAGS
                 reg_values = [int(self.emulator.reg_read(reg)) for reg in registers]  # type: ignore
                 self.tracer.trace = [CTraceEntry("reg", val) for val in reg_values]
                 traces.append(self.tracer.get_trace())
 
-            # Record taints
+            # 记录污点
             n_actors = self.state.current_test_case().n_actors()
             taints.append(self._taint_tracker.get_taint(n_actors))
 
@@ -400,134 +537,148 @@ class UnicornModel(Model, ABC):
 
     def _run_state_machine(self) -> None:
         """
-        Execute the loaded test case on the model with the loaded input.
+        在模型上使用加载的输入执行测试用例。
 
-        This method implements a state machine that repeatedly executes the test case
-        until it reaches the exit instruction while being in a non-speculative state.
+        该方法实现了状态机，反复执行测试用例直到在非推测状态下到达退出指令。
 
-        The state machine ensures that:
-            - whenever the emulator exits without reaching the exit instruction,
-              the model either rolls back (if in speculation) or exits (if not in speculation)
-            - whenever a fault is triggered, the model jumps to the corresponding fault handler
-              (if not in speculation) or rolls back (if in speculation)
-        The complete state machine is shown in:
-            `docs/assets/unicorn-model-state-machine.drawio.png`.
+        状态机保证：
+        - 当模拟器退出但未到达退出指令时：
+          如果在推测中则回滚，如果不在推测中则退出
+        - 当故障触发时：
+          如果不在推测中则跳转到故障处理程序，
+          如果在推测中则回滚
 
+        完整状态机图见：docs/assets/unicorn-model-state-machine.drawio.png
         """
         code_start = self.layout.code_start()
         pc = code_start
         while True:
             self.state.reset_after_em_stop(pc)
 
-            # Handle re-entries after faults and rollbacks
+            # 处理故障和回滚后的重新进入
             if pc != code_start:
                 in_speculation = self.speculator.in_speculation()
 
-                # When entering a new loop iterations, there are the following options:
-                # 1. Re-entering after reaching the end and not in speculation
+                # 进入新循环迭代时的选项：
+                # 1. 到达退出且不在推测中 -> 正常结束
                 if self.state.is_exit_addr(pc) and not in_speculation:
                     return
 
-                # 2. Re-entering after reaching the end and in speculation
+                # 2. 到达退出但在推测中 -> 回滚到检查点
                 if self.state.is_exit_addr(pc) and in_speculation:
                     pc = self.speculator.rollback()
                     self._log.dbg_rollback(pc)
                     continue
 
-                # 3. Re-entering into a fault handler and in speculation
+                # 3. 进入故障处理程序但在推测中 -> 需要再次回滚
                 if pc == self.state.fault_handler_addr and in_speculation:
-                    # This case indicates that the rollback was supposed to terminate speculation,
-                    # so rollback again
+                    # 这表示回滚本应终止推测，所以再回滚一次
                     pc = self.speculator.rollback()
                     self._log.dbg_rollback(pc)
                     continue
-                # 4. In all other cases, continue execution as normal
+                # 4. 其他情况 -> 正常继续执行
 
-            # Execute the test case
+            # 执行测试用例
             try:
                 self.emulator.emu_start(pc, self.layout.code_end(), timeout=10 * uc.UC_SECOND_SCALE)
             except UcError as e:
                 self.state.pending_fault = int(e.errno)  # type: ignore  # missing type annotation
 
-            # Handle faults
+            # 处理故障
             if self.state.pending_fault:
                 self._patch_context_after_fault()
                 pc = self._handle_fault()
                 if pc and pc != self.state.exit_addr:
                     continue
 
-            # If the model is in non-speculative state, a fault terminates the execution
+            # 如果模型不在推测状态，故障终止执行
             if not self.speculator.in_speculation():
                 return
 
-            # Otherwise (in a speculative state), a fault causes a speculation rollback
+            # 否则（在推测状态），故障导致推测回滚
             pc = self.speculator.rollback()
             self._log.dbg_rollback(pc)
             continue
 
     def _handle_fault(self) -> int:
         """
-        Handle a fault that was triggered during the execution
-        :return: address of the next instruction to execute OR zero if the fault triggers a rollback
+        处理执行期间触发的故障。
+
+        故障处理场景（按优先级）：
+        1. 有注册的推测机制处理此故障 -> 使用推测机制
+        2. 无推测机制但已在推测中 -> 回滚
+        3. 不在推测中且之前已有故障 -> 报错（嵌套故障）
+        4. 非嵌套非推测故障，在预期故障列表中 -> 跳转到故障处理程序
+        5. 非嵌套非推测故障，不在预期列表中 -> 报错（意外故障）
+
+        :param errno: 故障的错误号
+        :return: 下一条要执行的指令地址，或 0 表示触发回滚
         """
         errno = self.state.pending_fault
         self._log.dbg_exception(errno, _err_to_str(errno))
 
-        # clear the pending fault
+        # 清除待处理故障
         self.state.pending_fault = 0
 
-        # when a fault is triggered, CPU stores the PC and the fault type
-        # on stack - this has to be mirrored at the contract level
+        # 故障触发时，CPU 将 PC 和故障类型压入栈 - 需要在合约层面镜像
         rsp = self.layout.get_data_addr(DataArea.RSP_INIT, 0)
         self.tracer.observe_mem_access(UC_MEM_WRITE, rsp, 8, errno)
 
-        # Possible fault handling scenarios:
-        # 1. There is a registered speculation mechanism for this fault -> use it
+        # 故障处理场景：
+        # 1. 有注册的推测机制 -> 使用它
         next_addr = self.speculator.handle_fault(errno)
         if next_addr:
             return next_addr
 
-        # 2. No registered speculation mechanism, but we're already in speculation -> rollback
+        # 2. 无推测机制但在推测中 -> 回滚
         if self.speculator.in_speculation():
             return 0
 
-        # 3. Not in speculation, and we've already had a fault before -> throw an error
+        # 3. 不在推测中且之前已有故障 -> 嵌套故障错误
         if self.state.had_arch_fault:
             self.print_registers()
             error(f"Nested fault {errno} {_err_to_str(errno)}", print_last_tb=True)
         self.state.had_arch_fault = True
 
-        # 4. Not-nested non-speculative fault, and it is in a list of expected faults -> handle it
+        # 4. 非嵌套非推测故障，在预期列表中 -> 跳转到故障处理程序
         if errno in self._handled_faults:
             return self.state.fault_handler_addr
 
-        # 5. Non-nested non-speculative fault, and it is an unexpected fault -> throw an error
+        # 5. 非嵌套非推测故障，不在预期列表中 -> 意外故障错误
         self.print_registers()
         error(f"Unexpected exception {errno} {_err_to_str(errno)}", print_last_tb=True)
 
     def _patch_context_after_fault(self) -> None:
-        """ Patch the context to avoid Unicorn bugs """
+        """
+        在故障后修补上下文以避免 Unicorn bug。
+
+        Unicorn 在捕获异常后存在已知 bug：模拟器内部状态会被破坏。
+        解决方法是恢复预异常时保存的上下文，并重新写入标志位寄存器。
+        """
         if not self.state.previous_context:
             error("Fault triggered without a previous context")
 
-        # workaround for a Unicorn bug: after catching an exception
-        # we need to restore some pre-exception context. otherwise,
-        # the emulator becomes corrupted
+        # Unicorn bug 的 workaround：捕获异常后恢复预异常上下文，
+        # 否则模拟器内部状态会损坏
         self.emulator.context_restore(self.state.previous_context)
-        # another workaround, specifically for flags
+        # 另一个 workaround，专门针对标志位
         flags_id = self._target_desc.uc_target_desc.reg_norm_to_constant["FLAGS"]
         self.emulator.reg_write(flags_id, self.emulator.reg_read(flags_id))
 
     @abstractmethod
     def _load_input(self, input_: InputData) -> None:
-        """ Load registers and memory with given input: this is architecture specific """
+        """ 加载寄存器和内存的给定输入：此方法是架构特定的。 """
 
 
 # ==================================================================================================
-# Public: x86 implementation of the Unicorn Backend
+# 公共：x86 实现
 # ==================================================================================================
 class X86UnicornModel(UnicornModel):
-    """ Model for x86 architecture """
+    """
+    x86 架构的模型实现。
+
+    使用 Unicorn 的 x86-64 模式，处理 x86 特定的输入加载和寄存器初始化。
+    """
 
     def __init__(self,
                  bases: BaseAddrTuple,
@@ -536,10 +687,20 @@ class X86UnicornModel(UnicornModel):
                  tracer_cls: Type[UnicornTracer],
                  interpreter_cls: Type[ExtraInterpreter],
                  enable_mismatch_check_mode: bool = False) -> None:
+        """
+        初始化 x86 模型。
 
+        :param bases: 沙箱基地址元组
+        :param target_desc: 目标架构描述
+        :param speculator_cls: 推测器类
+        :param tracer_cls: 追踪器类
+        :param interpreter_cls: 额外解释器类
+        :param enable_mismatch_check_mode: 是否启用不匹配检查模式
+        """
         self._architecture = (uc.UC_ARCH_X86, uc.UC_MODE_64)
         self._flags_id = x86ucc.UC_X86_REG_EFLAGS
 
+        # 初始化溢出/下溢填充区（全零）
         self.underflow_pad_values = bytes(SandboxLayout.data_area_size(DataArea.UNDERFLOW_PAD))
         self.overflow_pad_values = bytes(SandboxLayout.data_area_size(DataArea.OVERFLOW_PAD))
 
@@ -548,75 +709,94 @@ class X86UnicornModel(UnicornModel):
 
     def _load_input(self, input_: InputData) -> None:
         """
-        Set the memory and register values in the emulator according to the input object provided.
-        In addition, set the memory permissions for each actor.
+        根据输入对象设置模拟器中的内存和寄存器值，
+        同时设置每个 actor 的内存权限。
 
-        :param input_: Input object containing the memory and register values for each actor.
+        x86-64 输入加载步骤：
+        1. 为每个 actor 写入内存区域（溢出区、主数据区、故障区、GPR区、SIMD区）
+        2. 修补 EFLAGS 值（确保保留的有效位正确）
+        3. 初始化通用寄存器（GPR）
+        4. 初始化 SIMD 寄存器（128位 XMM，YMM 上128位忽略）
+        5. 设置特殊寄存器（RSP、RBP、R14指向沙箱数据区）
+
+        :param input_: 输入对象，包含每个 actor 的内存和寄存器值
         """
 
         def patch_flags(flags: np.uint64) -> np.uint64:
+            """ 修补 EFLAGS 值：保留有效位（0x2263 = CF,PF,AF,ZF,SF,OF,TF,IF,DF）
+            并强制设置 bit 1（_RESERVED，x86 规范要求为 1）"""
             return (flags & np.uint64(2263)) | np.uint64(2)
 
         def write_area(area: DataArea, actor_id: int, data: bytes) -> None:
+            """ 将数据写入指定 actor 的指定数据区域 """
             em.mem_write(self.layout.get_data_addr(area, actor_id), data)
 
-        # shortcuts to save on typing
+        # 快捷变量
         em = self.emulator
         regs = self._uc_target_desc.usable_registers
 
-        # Initialize memory for each actor:
+        # 为每个 actor 初始化内存：
         n_actors = self.state.current_test_case().n_actors()
         for actor_id in range(n_actors):
             input_fragment = input_[actor_id]
 
-            # - initialize overflows with zeroes
+            # - 初始化溢出区为零
             write_area(DataArea.OVERFLOW_PAD, actor_id, self.overflow_pad_values)
             write_area(DataArea.UNDERFLOW_PAD, actor_id, self.underflow_pad_values)
 
-            # - sandbox data pages
+            # - 沙箱数据页
             write_area(DataArea.MAIN, actor_id, input_fragment['main'].tobytes())
             write_area(DataArea.FAULTY, actor_id, input_fragment['faulty'].tobytes())
 
-            # - GPRs
-            # Note: Executor uses the GPR area to initialize EFLAGS, so we need to patch them
-            #      before writing them to the emulator to ensure consistency.
+            # - GPR 区域
+            # 注意：执行器使用 GPR 区域初始化 EFLAGS，需要修补以确保一致性
             input_fragment['gpr'][6] = patch_flags(input_fragment['gpr'][6])
-            # input_fragment['gpr'][7] = np.uint64(self.layout.get_data_addr(DataArea.RSP_INIT, 0))
             write_area(DataArea.GPR, actor_id, input_fragment['gpr'].tobytes())
 
-            # - SIMD
+            # - SIMD 区域
             write_area(DataArea.SIMD, actor_id, input_fragment['simd'].tobytes())
 
-        # Registers are initialized with the main actor's input
+        # 寄存器使用主 actor 的输入初始化
         input_fragment = input_[0]
 
-        # - initialize GPRs
+        # - 初始化通用寄存器
         value: np.uint64
         for i, value in enumerate(input_fragment['gpr']):
             em.reg_write(regs[i], int(value))
 
-        # similarly to above, patch reg. values
+        # 同样修补 EFLAGS 寄存器值
         em.reg_write(x86ucc.UC_X86_REG_EFLAGS, int(patch_flags(input_fragment['gpr'][6])))
+        # 设置特殊寄存器：栈指针、基指针、数据区基址
         em.reg_write(x86ucc.UC_X86_REG_RSP, self.layout.get_data_addr(DataArea.RSP_INIT, 0))
         em.reg_write(x86ucc.UC_X86_REG_RBP, self.layout.get_data_addr(DataArea.RSP_INIT, 0))
         em.reg_write(x86ucc.UC_X86_REG_R14, self.layout.get_data_addr(DataArea.MAIN, 0))
 
-        # - initialize SIMD
+        # - 初始化 SIMD 寄存器
+        # Unicorn 不完全支持 YMM（256位），因此只初始化 XMM（128位）
+        # 两个连续的 64 位值组合为一个 128 位 XMM 值
         simd_values: List[int] = []
         for i, val in enumerate(input_fragment['simd']):
             if i % 4 == 0:
-                simd_values.append(int(val))
+                simd_values.append(int(val))  # XMM 低64位
             elif i % 4 == 1:
-                simd_values[-1] |= int(val) << 64
+                simd_values[-1] |= int(val) << 64  # XMM 高64位（与低64位组合）
             else:
-                # Unicorn doesn't properly support YMM, so the upper 128 bits are ignored
+                # YMM 的上128位被忽略（Unicorn 不支持）
                 continue
         for i, simd_value in enumerate(simd_values):
             em.reg_write(self._uc_target_desc.usable_simd128_registers[i], simd_value)
 
     def print_registers(self, oneline: bool = False) -> None:
+        """ 打印当前 x86-64 寄存器值。
+
+        地址值被压缩显示：沙箱数据区地址显示为 base+offset，
+        其他地址显示为完整十六进制值。
+
+        :param oneline: 是否单行显示（支持彩色输出）
+        """
 
         def compressed(val: int) -> str:
+            """ 压缩地址显示：数据区地址显示为偏移量，其他显示完整值 """
             if self.layout.is_data_addr(val):
                 return f"base+0x{self.layout.data_addr_to_offset(val):<9x}"
             return f"0x{val:016x}"
@@ -673,10 +853,14 @@ class X86UnicornModel(UnicornModel):
 
 
 # ==================================================================================================
-# Public: arm64 implementation of the Unicorn Backend
+# 公共：ARM64 实现
 # ==================================================================================================
 class ARM64UnicornModel(UnicornModel):
-    """ Model for arm64 architecture """
+    """
+    ARM64 架构的模型实现。
+
+    使用 Unicorn 的 ARM64 模式，处理 ARM64 特定的输入加载和寄存器初始化。
+    """
 
     def __init__(self,
                  bases: BaseAddrTuple,
@@ -685,10 +869,20 @@ class ARM64UnicornModel(UnicornModel):
                  tracer_cls: Type[UnicornTracer],
                  interpreter_cls: Type[ExtraInterpreter],
                  enable_mismatch_check_mode: bool = False) -> None:
+        """
+        初始化 ARM64 模型。
 
+        :param bases: 沙箱基地址元组
+        :param target_desc: 目标架构描述
+        :param speculator_cls: 推测器类
+        :param tracer_cls: 追踪器类
+        :param interpreter_cls: 额外解释器类
+        :param enable_mismatch_check_mode: 是否启用不匹配检查模式
+        """
         self._architecture = (uc.UC_ARCH_ARM64, uc.UC_MODE_ARM)
         self._flags_id = armucc.UC_ARM64_REG_NZCV
 
+        # 初始化溢出/下溢填充区（全零）
         self.underflow_pad_values = bytes(SandboxLayout.data_area_size(DataArea.UNDERFLOW_PAD))
         self.overflow_pad_values = bytes(SandboxLayout.data_area_size(DataArea.OVERFLOW_PAD))
 
@@ -697,67 +891,79 @@ class ARM64UnicornModel(UnicornModel):
 
     def _load_input(self, input_: InputData) -> None:
         """
-        Set the memory and register values in the emulator according to the input object provided.
-        In addition, set the memory permissions for each actor.
+        根据输入对象设置模拟器中的内存和寄存器值，
+        同时设置每个 actor 的内存权限。
 
-        :param input_: Input object containing the memory and register values for each actor.
+        ARM64 输入加载步骤：
+        1. 为每个 actor 写入内存区域
+        2. 修补 NZCV 标志位值（左移28位到标志位位置）
+        3. 初始化通用寄存器
+        4. 设置特殊寄存器（SP、actor基址寄存器）
+
+        :param input_: 输入对象，包含每个 actor 的内存和寄存器值
         """
 
-        # FIXME: dudup this code with x86
+        # FIXME: 与 x86 的代码去重
 
         def patch_flags(flags: np.uint64) -> np.uint64:
+            """ 修补 NZCV 标志位：将值左移28位到 ARM64 标志位位置
+            （N[31], Z[30], C[29], V[28]）"""
             return (flags << np.uint64(28)) % np.uint64(pow(2, 64) - 1)
 
         def write_area(area: DataArea, actor_id: int, data: bytes) -> None:
+            """ 将数据写入指定 actor 的指定数据区域 """
             em.mem_write(self.layout.get_data_addr(area, actor_id), data)
 
-        # shortcuts to save on typing
+        # 快捷变量
         em = self.emulator
         regs = self._uc_target_desc.usable_registers
 
-        # Initialize memory for each actor:
+        # 为每个 actor 初始化内存：
         n_actors = self.state.current_test_case().n_actors()
         init_gpr: List[np.uint64]
         for actor_id in range(n_actors):
             input_fragment = input_[actor_id].copy()
 
-            # - initialize overflows with zeroes
+            # - 初始化溢出区为零
             write_area(DataArea.OVERFLOW_PAD, actor_id, self.overflow_pad_values)
             write_area(DataArea.UNDERFLOW_PAD, actor_id, self.underflow_pad_values)
 
-            # - sandbox data pages
+            # - 沙箱数据页
             write_area(DataArea.MAIN, actor_id, input_fragment['main'].tobytes())
             write_area(DataArea.FAULTY, actor_id, input_fragment['faulty'].tobytes())
 
-            # - GPRs
-            # Note: Executor uses the GPR area to initialize EFLAGS, so we need to patch them
-            #      before writing them to the emulator to ensure consistency.
+            # - GPR 区域
+            # 注意：执行器使用 GPR 区域初始化 NZCV，需要修补以确保一致性
             input_fragment['gpr'][6] = patch_flags(input_fragment['gpr'][6])
-            # input_fragment['gpr'][7] = np.uint64(self.layout.get_data_addr(DataArea.RSP_INIT, 0))
             write_area(DataArea.GPR, actor_id, input_fragment['gpr'].tobytes())
 
-            # - SIMD
+            # - SIMD 区域
             write_area(DataArea.SIMD, actor_id, input_fragment['simd'].tobytes())
 
-            # Save the GPR area of the main actor as it will be used to initialize registers
+            # 保存主 actor 的 GPR 区域用于寄存器初始化
             if actor_id == 0:
                 init_gpr = input_fragment['gpr']
 
-        # - initialize GPRs
+        # - 初始化通用寄存器
         value: np.uint64
         for i, value in enumerate(init_gpr):
             em.reg_write(regs[i], int(value))
 
-        # similarly to above, patch reg. values
+        # 同样修补 NZCV 标志位寄存器值
         em.reg_write(self._uc_target_desc.flags_register, int(init_gpr[6]))
+        # 设置特殊寄存器：栈指针、actor数据区基址
         em.reg_write(self._uc_target_desc.sp_register,
                      self.layout.get_data_addr(DataArea.RSP_INIT, 0))
         em.reg_write(self._uc_target_desc.actor_base_register,
                      self.layout.get_data_addr(DataArea.MAIN, 0))
 
     def print_registers(self, oneline: bool = False) -> None:
+        """ 打印当前 ARM64 寄存器值。
+        :param oneline: 是否单行显示（支持彩色输出）
+        """
 
         def compressed(val: int) -> str:
+            """ 压缩地址显示 """
             if self.layout.is_data_addr(val):
                 return f"base+0x{self.layout.data_addr_to_offset(val):<9x}"
             return f"0x{val:016x}"

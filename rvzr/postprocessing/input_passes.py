@@ -1,5 +1,12 @@
 """
-File: Collection of minimization passes that operate on the test case input data.
+文件：输入数据最小化pass集合——对测试用例的输入数据进行操作。
+
+该模块包含两种输入最小化pass：
+1. InputSequenceMinimizationPass：通过迭代移除输入序列中的输入来减少输入数量
+2. DifferentialInputMinimizerPass：通过逐步将两个违规输入之间的差异归零来最小化差异
+
+这些pass的目的是在不丢失违规的前提下，尽可能简化输入数据，
+使得违规更容易理解和分析。
 
 Copyright (C) Microsoft Corporation
 SPDX-License-Identifier: MIT
@@ -20,45 +27,58 @@ if TYPE_CHECKING:
     from ..tc_components.test_case_code import TestCaseProgram
     from ..tc_components.test_case_data import InputData
 
-_PER_ACTOR_INPUT_SIZE: Final[int] = 0x4000  # 16 KB per actor
-_PRINT_BLOCK_SIZE: Final[int] = 8  # print progress indicator in 8-byte blocks
-_PRINT_LINE_SIZE: Final[int] = 64  # print progress indicator in (64 * 8)-byte lines
-_MAX_BLOCK_SIZE: Final[int] = 64  # try to zero out up to 64 bytes at once
+_PER_ACTOR_INPUT_SIZE: Final[int] = 0x4000  # 每个actor的输入大小：16 KB
+_PRINT_BLOCK_SIZE: Final[int] = 8  # 进度指示器按8字节块打印
+_PRINT_LINE_SIZE: Final[int] = 64  # 进度指示器按(64 * 8)字节行打印
+_MAX_BLOCK_SIZE: Final[int] = 64  # 尝试一次性归零的最大块大小（64字节）
 
 
 class BaseInputMinimizationPass(BaseMinimizationPass):
-    """ Base class for a minimization pass that operates on inputs. """
+    """ 输入最小化pass的基类，提供公共接口。 """
 
     @abc.abstractmethod
     def run(self, test_case: TestCaseProgram, org_inputs: List[InputData],
             org_violation: Violation) -> List[InputData]:
-        """ Main function that runs the minimization pass
-        :param test_case: The test case object to work on
-        :param org_inputs: List of inputs to minimize
-        :param org_violation: The original violation
-        :return: List of minimized inputs
+        """ 
+        执行输入最小化pass的主函数
+        :param test_case: 要操作的测试用例对象
+        :param org_inputs: 待最小化的输入列表
+        :param org_violation: 原始违规对象
+        :return: 最小化后的输入列表
         """
 
 
 class InputSequenceMinimizationPass(BaseInputMinimizationPass):
     """
-    A minimization pass that iteratively removes inputs from the violating the input sequence
-    and checks if the violation is still triggered.
+    输入序列最小化pass——通过迭代移除输入序列中的输入，
+    检查违规是否仍然被触发，从而减少输入数量。
+
+    算法分两阶段：
+    1. 先通过二分法快速减少输入数量（直到违规不再触发为止）
+    2. 再通过逐个移除输入进行精细最小化
     """
     name = "Input Sequence Minimization"
 
     def run(self, test_case: TestCaseProgram, org_inputs: List[InputData],
             org_violation: Violation) -> List[InputData]:
+        """
+        执行输入序列最小化。
+        :param test_case: 测试用例对象
+        :param org_inputs: 原始输入列表
+        :param org_violation: 原始违规对象
+        :return: 最小化后的违规输入序列
+        """
         self._progress.pass_msg("Reducing the number of inputs by halving")
         org_len = len(org_inputs)
 
+        # 第一阶段：二分法快速减少
         violation = org_violation
         nonboosted_inputs = org_inputs
         while len(nonboosted_inputs) > 5:
-            new_inputs = nonboosted_inputs[:len(nonboosted_inputs) // 2]
+            new_inputs = nonboosted_inputs[:len(nonboosted_inputs) // 2]  # 取前半部分
             new_violation = self._fuzzer.fuzzing_round(test_case, new_inputs, [])
             if not new_violation:
-                break
+                break  # 违规不再触发，停止二分
             nonboosted_inputs = new_inputs
             violation = new_violation
 
@@ -67,75 +87,89 @@ class InputSequenceMinimizationPass(BaseInputMinimizationPass):
         else:
             self._progress.pass_msg("Result: Could not reduce the number of inputs")
 
-        # Get boosted inputs and disable boosting from now on
+        # 获取增强后的输入并从现在起禁用增强
         inputs = violation.input_sequence
         org_ipc = CONF.inputs_per_class
-        CONF.inputs_per_class = 1  # disable boosting from now on
+        CONF.inputs_per_class = 1  # 禁用输入增强
 
+        # 第二阶段：逐个移除输入进行精细最小化
         n_iterations = 10
         self._progress.pass_msg("Reducing the input sequence iteratively")
         for iteration in range(n_iterations):
             self._progress.pass_msg(f"Iteration {iteration + 1}")
             org_len = len(inputs)
-            for input_id in range(org_len, 0, -1):
-                new_inputs = inputs[0:input_id] + inputs[input_id + 1:]
+            for input_id in range(org_len, 0, -1):  # 从后向前尝试移除每个输入
+                new_inputs = inputs[0:input_id] + inputs[input_id + 1:]  # 移除第input_id个输入
                 new_violation = self._fuzzer.fuzzing_round(test_case, new_inputs, [])
                 if not new_violation:
                     self._progress.next(False)
-                    continue
+                    continue  # 移除后违规不再触发，跳过
                 self._progress.next(True)
                 inputs = new_inputs
                 violation = new_violation
             self._progress.pass_finish()
             if len(inputs) == org_len:
-                break
+                break  # 没有进一步减少，停止迭代
         self._progress.pass_msg(f"Result: Reduced to {len(inputs)} inputs")
-        CONF.inputs_per_class = org_ipc
+        CONF.inputs_per_class = org_ipc  # 恢复原始配置
         return violation.input_sequence
 
 
 class DifferentialInputMinimizerPass(BaseInputMinimizationPass):
     """
-    A minimization pass that iteratively minimizes the difference between two violating inputs.
-    It tries to zero out blocks of decreasing size and checks if the violation is still triggered.
-    If this is not possible, it tries to copy the byte between the two inputs.
+    差异输入最小化pass——通过迭代最小化两个违规输入之间的差异。
+    
+    算法对每个字节块依次尝试：
+    1. 将大块归零并检查违规是否仍触发（逐步减小块大小）
+    2. 将单个字节归零
+    3. 如果字节已经相等则跳过
+    4. 尝试将两个输入的该字节统一
+    5. 如果以上都失败，标记该地址为泄露地址
+
+    进度输出符号：.（成功归零）、=（字节已相等）、+（成功统一）、^（泄露地址）
     """
     name = "Differential Input Minimizer"
 
-    _test_case: Optional[TestCaseProgram] = None
-    _inputs: Optional[List[InputData]] = None
-    _violating_ids: Optional[Tuple[int, int]] = None
-    _local_ignore_list: List[int] = []
-    _leaked_addresses: List[int] = []
+    _test_case: Optional[TestCaseProgram] = None  # 当前测试用例
+    _inputs: Optional[List[InputData]] = None  # 当前输入序列
+    _violating_ids: Optional[Tuple[int, int]] = None  # 两个违规输入的ID
+    _local_ignore_list: List[int] = []  # 非违规输入ID列表（检查时忽略）
+    _leaked_addresses: List[int] = []  # 发现的泄露地址列表
 
     def run(self, test_case: TestCaseProgram, _: List[InputData],
             org_violation: Violation) -> List[InputData]:
+        """
+        执行差异输入最小化。
+        :param test_case: 测试用例对象
+        :param org_violation: 原始违规对象
+        :return: 最小化后的输入列表
+        """
 
-        # Set the context for this pass
+        # 设置pass的上下文信息
         self._set_pass_context(test_case, org_violation)
         assert self._violating_ids is not None
         self._progress.pass_msg("Minimizing the difference between inputs"
                                 f" {self._violating_ids[0]} and {self._violating_ids[1]}")
 
-        # Disable boosting for this pass as we already operate on the boosted inputs
+        # 禁用输入增强，因为我们已经在增强后的输入上操作
         org_conf = (CONF.inputs_per_class,)
         CONF.inputs_per_class = 1
 
-        # Print header for progress output
+        # 打印进度输出的标题
         print(f'\n{"Address":<11}', end="", flush=True)
         for i in range(0, 64, 8):
             print(f"+0x{i * 8:<6x}", end="", flush=True)
 
-        # Start the pass
+        # 开始处理每个actor
         for actor_id in range(len(CONF.get_actors_conf())):
             self._process_actor(actor_id)
         print("")
 
-        # Print summary
+        # 打印结果摘要
         self._progress.pass_msg(f"Result: Leaked {len(self._leaked_addresses)} bytes")
         self._progress.pass_msg(f"Addresses: {[hex(addr) for addr in self._leaked_addresses]}")
 
-        # Restore original configuration
+        # 恢复原始配置
         assert self._inputs is not None
         new_inputs = list(self._inputs)
         CONF.inputs_per_class = org_conf[0]
@@ -145,31 +179,31 @@ class DifferentialInputMinimizerPass(BaseInputMinimizationPass):
 
     def _set_pass_context(self, test_case: TestCaseProgram, org_violation: Violation) -> None:
         """
-        Set the context for the minimization pass.
-        :param test_case: The test case object to work on
-        :param org_violation: The original violation
+        设置最小化pass的上下文信息。
+        :param test_case: 测试用例对象
+        :param org_violation: 原始违规对象
         :return: None
         """
-        # Store the test case and inputs
+        # 存储测试用例和输入
         self._test_case = test_case
         self._inputs = org_violation.input_sequence
 
-        # For convenience, also store the two inputs to minimize
+        # 存储两个需要最小化的违规输入ID
         violating_input_ids = [i.input_id for i in org_violation.measurements]
         if len(violating_input_ids) > 2:
-            violating_input_ids = violating_input_ids[:2]
+            violating_input_ids = violating_input_ids[:2]  # 仅取前两个
         self._violating_ids = (violating_input_ids[0], violating_input_ids[1])
 
-        # Store a list of all other input IDs, which we will ignore during checks
+        # 存储其他输入ID列表，检查违规时将忽略这些输入
         self._local_ignore_list = [
             i for i in range(len(self._inputs)) if i not in violating_input_ids
         ]
 
-        # Finally, make a list to store all leaked addresses
+        # 创建泄露地址列表
         self._leaked_addresses = []
 
     def _reset_pass_context(self) -> None:
-        """ Reset the context for the minimization pass. """
+        """ 重置最小化pass的上下文信息。 """
         self._test_case = None
         self._inputs = None
         self._local_ignore_list = []
@@ -177,97 +211,97 @@ class DifferentialInputMinimizerPass(BaseInputMinimizationPass):
 
     def _process_actor(self, actor_id: int) -> None:
         """
-        Process the input regions of a single actor.
-        :param actor_id: The actor ID
+        处理单个actor的所有输入区域。
+        :param actor_id: actor ID
         """
         assert self._inputs is not None and self._violating_ids is not None
 
-        # Process all input regions of the actor
+        # 处理actor的所有输入区域
         region_offset = 0
         for region_name in ['main', 'faulty', 'gpr', 'simd']:
             region_size = len(self._inputs[self._violating_ids[0]][actor_id][region_name])
 
-            # Within each region, process all bytes
+            # 在每个区域内逐块处理所有字节
             i = 0
             while i < region_size:
                 absolute_address = actor_id * _PER_ACTOR_INPUT_SIZE + region_offset + i * 8
 
-                # Periodically break lines and print spaces for better readability
+                # 定期换行和打印空格以提高可读性
                 if i % _PRINT_LINE_SIZE == 0:
                     print(f"\n0x{absolute_address:08x} ", end="", flush=True)
                 elif i % _PRINT_BLOCK_SIZE == 0:
                     print(" ", end="", flush=True)
 
-                # Process the block starting at the current index
+                # 处理从当前索引开始的块
                 processed_block_size = self._process_block(actor_id, region_name, i, region_size,
                                                            absolute_address)
                 i += processed_block_size
 
-            region_offset += region_size * 8
+            region_offset += region_size * 8  # 更新区域偏移（按8字节单位计算）
 
     def _process_block(self, actor_id: int, region_name: str, block_start: int, region_size: int,
                        absolute_address: int) -> int:
         """
-        Try to minimize the difference between the two inputs at the given index.
+        尝试最小化两个输入在给定索引处的差异。
+        返回处理的块大小（字节数）。
         """
         assert self._test_case is not None and self._inputs is not None \
                and self._violating_ids is not None
-        input_a = self._inputs[self._violating_ids[0]]
-        input_b = self._inputs[self._violating_ids[1]]
-        org_input_a = deepcopy(input_a)
+        input_a = self._inputs[self._violating_ids[0]]  # 第一个违规输入
+        input_b = self._inputs[self._violating_ids[1]]  # 第二个违规输入
+        org_input_a = deepcopy(input_a)  # 保存原始值的副本
         org_input_b = deepcopy(input_b)
 
         def _restore_addr(addr: int) -> None:
+            """ 恢复两个输入在指定地址的原始值 """
             input_a[actor_id][region_name][addr] = org_input_a[actor_id][region_name][addr]
             input_b[actor_id][region_name][addr] = org_input_b[actor_id][region_name][addr]
 
         def _zero_out_block(addr: int) -> int:
             """
-            Try to zero out a block of memory and check if the violation is still triggered.
-            Start with the largest possible block size and iteratively decrease the block size
-            until violation is triggered or the block size is 1.
-            :return: The size of the block that was successfully zeroed out, or 1
+            尝试将一块内存归零并检查违规是否仍被触发。
+            从最大可能的块大小开始，逐步减小块大小直到违规被触发或块大小为1。
+            :return: 成功归零的块大小，或1
             """
             assert input_a is not None and input_b is not None and \
                 self._test_case is not None and self._inputs is not None
 
-            # Find a suitable starting block size, fulfilling the following criteria:
-            #    * the block size is less then 512 bytes (64 * 8)
+            # 确定合适的起始块大小，需满足以下条件：
+            #    * 块大小不超过512字节（64 * 8）
             block_size: int = _MAX_BLOCK_SIZE - (addr % _MAX_BLOCK_SIZE)
-            #    * the block does not overlap with the next region
+            #    * 块不与下一个区域重叠
             block_size = min(block_size, region_size - addr)
-            #    * the block size is a power of 2
+            #    * 块大小为2的幂
             block_size = 2**int(log2(block_size))
-            #    * i mod block_size == 0
+            #    * addr mod block_size == 0（地址对齐）
             while block_size > 1 and addr % block_size != 0:
                 block_size //= 2
 
-            # Starting from the determined block size, try to find the largest block
-            # such that zeroing out the block still triggers the violation
+            # 从确定的块大小开始，尝试找到最大的块使得归零后违规仍被触发
             while block_size > 1:
-                # Try zeroing out the block
+                # 尝试归零该块
                 for i in range(block_size):
                     input_a[actor_id][region_name][addr + i] = 0
                     input_b[actor_id][region_name][addr + i] = 0
 
-                # Check if the violation is still triggered
+                # 检查违规是否仍被触发
                 if self._check_for_violation(self._test_case, self._inputs,
                                              self._local_ignore_list):
-                    # If reproduced, we managed to zero out the block; return
+                    # 违规仍触发，成功归零该块；返回
                     return block_size
 
-                # If not reproduced, restore the original values and try a smaller block
+                # 违规不再触发，恢复原始值并尝试更小的块
                 for i in range(block_size):
                     _restore_addr(addr + i)
                 block_size //= 2
 
-            # If we reach here, we could not zero out a block larger than 1 byte
+            # 无法归零大于1字节的块
             return 1
 
-        # First, try setting a large block of bytes to zero
+        # 首先，尝试将大块字节归零
         block_size = _zero_out_block(block_start)
         if block_size > 1:
-            # If reproduced, print progress and return the block size
+            # 成功归零，打印进度并返回块大小
             n_64byte_blocks = block_size // 8
             n_remainder_bytes = block_size % 8
             if n_remainder_bytes > 0:
@@ -279,7 +313,7 @@ class DifferentialInputMinimizerPass(BaseInputMinimizationPass):
                 print("." * 8, end="", flush=True)
             return block_size
 
-        # try zeroing out a single byte
+        # 尝试归零单个字节
         input_a[actor_id][region_name][block_start] = 0
         input_b[actor_id][region_name][block_start] = 0
         if self._check_for_violation(self._test_case, self._inputs, self._local_ignore_list):
@@ -287,13 +321,13 @@ class DifferentialInputMinimizerPass(BaseInputMinimizationPass):
             return 1
         _restore_addr(block_start)
 
-        # check if the bytes are already equal; if so, nothing more to do here
+        # 检查字节是否已经相等；如果相等，无需进一步处理
         if input_a[actor_id][region_name][block_start] == \
            input_b[actor_id][region_name][block_start]:
             print("=", end="", flush=True)
             return 1
 
-        # try copying the byte between the two inputs
+        # 尝试将两个输入的该字节统一（将input_b的值设为input_a的值）
         input_a[actor_id][region_name][block_start] = \
             org_input_a[actor_id][region_name][block_start]
         input_b[actor_id][region_name][block_start] = \
@@ -303,7 +337,7 @@ class DifferentialInputMinimizerPass(BaseInputMinimizationPass):
             return 1
         _restore_addr(block_start)
 
-        # if failing, we found a leaked address
+        # 以上方法都失败，发现了泄露地址
         print("^", end="", flush=True)
         self._leaked_addresses.append(absolute_address)
         return 1

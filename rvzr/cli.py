@@ -1,6 +1,10 @@
 """
-File: Function definitions for using Revizor as command-line tool
-(Note: the actual CLI is accessed via revizor.py)
+文件：命令行工具的功能定义（Revizor 的 CLI 入口）
+（注意：实际的 CLI 通过 revizor.py 访问）
+
+本模块定义了侧信道模糊测试框架的命令行接口，包括参数解析和
+各子命令（fuzz、tfuzz、reproduce、minimize、generate、analyse、download_spec）
+的启动逻辑。main() 函数是核心入口，根据子命令类型调用相应的模糊测试器或工具。
 
 Copyright (C) Microsoft Corporation
 SPDX-License-Identifier: MIT
@@ -22,6 +26,17 @@ if TYPE_CHECKING:
 
 
 def _arg2bool(arg: Any) -> bool:
+    """将命令行参数转换为布尔值，支持多种字符串表示形式。
+
+    参数:
+        arg: 命令行参数值，可以是布尔值或字符串
+
+    返回:
+        对应的布尔值
+
+    异常:
+        ArgumentTypeError: 当参数无法转换为布尔值时抛出
+    """
     if isinstance(arg, bool):
         return arg
     if arg.lower() in ('yes', 'true', 't', 'y', '1'):
@@ -32,12 +47,26 @@ def _arg2bool(arg: Any) -> bool:
 
 
 def _parse_args() -> Any:  # pylint: disable=r0915
+    """解析命令行参数，构建各子命令的参数解析器。
+
+    本函数定义了所有子命令及其参数选项，包括：
+    - fuzz: 标准模糊测试模式
+    - tfuzz: 基于模板的模糊测试模式
+    - analyse: 独立的追踪分析接口
+    - reproduce: 重现已检测到的违规
+    - minimize: 测试用例最小化
+    - generate: 独立的测试用例生成
+    - download_spec: 下载 ISA 规范文件
+
+    返回:
+        解析后的命令行参数对象
+    """
     parser = ArgumentParser(add_help=False)
     subparsers = parser.add_subparsers(dest='subparser_name')
-    subparsers.required = True
+    subparsers.required = True  # 必须指定子命令
 
     # ==============================================================================================
-    # Common arguments
+    # 公共参数 - 所有子命令共享的基础参数
     common_parser = ArgumentParser(add_help=False)
     common_parser.add_argument(
         "-c",
@@ -64,7 +93,7 @@ def _parse_args() -> Any:  # pylint: disable=r0915
     )
 
     # ==============================================================================================
-    # Fuzzing
+    # 模糊测试子命令 - 标准模糊测试模式的参数定义
     parser_fuzz = subparsers.add_parser(
         'fuzz',
         add_help=True,
@@ -111,7 +140,7 @@ def _parse_args() -> Any:  # pylint: disable=r0915
     )
 
     # ==============================================================================================
-    # Template-based fuzzing
+    # 基于模板的模糊测试子命令 - 使用预定义模板生成测试用例
     parser_tfuzz = subparsers.add_parser(
         'tfuzz',
         add_help=True,
@@ -158,7 +187,7 @@ def _parse_args() -> Any:  # pylint: disable=r0915
     )
 
     # ==============================================================================================
-    # Standalone interface to trace analysis
+    # 追踪分析子命令 - 独立分析合约追踪与硬件追踪的差异
     parser_analyser = subparsers.add_parser(
         'analyse',
         add_help=True,
@@ -176,7 +205,7 @@ def _parse_args() -> Any:  # pylint: disable=r0915
     )
 
     # ==============================================================================================
-    # Reproducing violation
+    # 违规重现子命令 - 重新执行检测到违规的测试用例以确认结果
     parser_reproduce = subparsers.add_parser(
         'reproduce',
         add_help=True,
@@ -206,7 +235,7 @@ def _parse_args() -> Any:  # pylint: disable=r0915
     )
 
     # ==============================================================================================
-    # Postprocessing interface
+    # 测试用例最小化子命令 - 通过多轮简化缩小违规测试用例规模
     parser_mini = subparsers.add_parser(
         'minimize',
         add_help=True,
@@ -247,6 +276,7 @@ def _parse_args() -> Any:  # pylint: disable=r0915
         default=1,
         help="Number of attempts to minimize the test case.",
     )
+    # 以下为各最小化 pass 的开关参数
     parser_mini.add_argument(
         '--enable-instruction-pass',
         type=_arg2bool,
@@ -318,7 +348,7 @@ def _parse_args() -> Any:  # pylint: disable=r0915
     )
 
     # ==============================================================================================
-    # Standalone interface to test case generation
+    # 测试用例生成子命令 - 独立生成测试用例（不运行模糊测试）
     parser_generator = subparsers.add_parser(
         'generate',
         add_help=True,
@@ -357,7 +387,7 @@ def _parse_args() -> Any:  # pylint: disable=r0915
     )
 
     # ==============================================================================================
-    # Loading of ISA specs
+    # ISA 规范下载子命令 - 下载指定架构的指令集规范文件
     parser_get_isa = subparsers.add_parser('download_spec', add_help=True)
     parser_get_isa.add_argument("-a", "--architecture", type=str, required=True)
     parser_get_isa.add_argument(
@@ -372,18 +402,29 @@ def _parse_args() -> Any:  # pylint: disable=r0915
 
 def main() -> int:  # pylint: disable=r0911,r0912,r0915  # this function is necessarily complex
     """
-    Parse command-line arguments and launch the fuzzer in the requested mode.
+    解析命令行参数并启动相应模式的模糊测试器。
+
+    本函数是 CLI 的核心入口，根据子命令类型执行以下操作：
+    - fuzz/tfuzz: 启动模糊测试循环
+    - reproduce: 重现已检测到的违规
+    - generate: 独立生成测试用例
+    - analyse: 分析追踪文件
+    - minimize: 最小化测试用例
+    - download_spec: 下载 ISA 规范
+
+    返回:
+        退出码（0 表示成功，1 表示错误）
     """
     args = _parse_args()
 
-    # Update configuration
+    # 更新配置 - 加载 YAML 配置文件，并在使用现有测试用例时禁用随机生成
     if getattr(args, 'config', None):
         CONF.load(args.config, args.include_dir)
     if getattr(args, 'testcase', None):
         CONF.disable_generation()
     update_logging_after_config_change()
 
-    # Check if the file and directory arguments are valid
+    # 检查文件和目录参数是否有效
     if getattr(args, 'testcase', None) and not os.path.isfile(args.testcase):
         print("[ERROR]", f"The test case file `{args.testcase}` does not exist")
         return 1
@@ -398,25 +439,25 @@ def main() -> int:  # pylint: disable=r0911,r0912,r0915  # this function is nece
             "require flag --input-outdir to be set.")
         return 1
 
-    # Enforce the Unicorn version: New versions of Unicorn have a bug that causes false positives
-    # in the fuzzer. This is a temporary workaround until the bug is fixed.
+    # 强制 Unicorn 版本检查：新版本 Unicorn 存在导致模糊测试误报的 bug，
+    # 这是临时解决方案，直到该 bug 被修复
     if unicorn.__version__ != '1.0.3' and CONF.instruction_set == 'x86-64':  # type: ignore
         print(
             "[ERROR]", "The fuzzer requires Unicorn version 1.0.3. Please install it using "
             "`pip install unicorn==1.0.3`.")
         return 1
 
-    # Fuzzing
+    # 模糊测试模式 - 根据子命令类型选择模糊测试策略
     if args.subparser_name in ('fuzz', 'tfuzz'):
         testcase = args.testcase if args.subparser_name == 'fuzz' else args.template
         fuzzer = get_fuzzer(args.instruction_set, args.working_directory, testcase, None)
         type_: FuzzingMode
         if args.subparser_name == 'tfuzz':
-            type_ = 'template'
+            type_ = 'template'       # 基于模板的模糊测试
         elif testcase:
-            type_ = 'asm'
+            type_ = 'asm'            # 使用已有汇编测试用例
         else:
-            type_ = 'random'
+            type_ = 'random'         # 随机生成测试用例
         exit_code = fuzzer.start(
             args.num_test_cases,
             args.num_inputs,
@@ -426,26 +467,26 @@ def main() -> int:  # pylint: disable=r0911,r0912,r0915  # this function is nece
             type_=type_)
         return exit_code
 
-    # Reproducing a violation
+    # 违规重现模式 - 重新执行检测到违规的测试用例以确认结果
     if args.subparser_name == 'reproduce':
         fuzzer = get_fuzzer(args.instruction_set, "", args.testcase, args.inputs)
         exit_code = fuzzer.start(1, args.num_inputs, 0, False, False, type_='asm')
         return exit_code
 
-    # Stand-alone generation
+    # 独立测试用例生成模式 - 仅生成测试用例，不运行模糊测试
     if args.subparser_name == "generate":
         fuzzer = get_fuzzer(args.instruction_set, args.working_directory, "", None)
         fuzzer.standalone_generate(args.seed, args.num_test_cases, args.num_inputs,
                                    args.permit_overwrite)
         return 0
 
-    # Trace analysis
+    # 追踪分析模式 - 独立分析合约追踪与硬件追踪
     if args.subparser_name == 'analyse':
         fuzzer = get_fuzzer(args.instruction_set, "", "", None)
         fuzzer.standalone_analyse(args.ctraces, args.htraces)
         return 0
 
-    # Test case minimization
+    # 测试用例最小化模式 - 执行多轮简化 pass 缩小违规测试用例规模
     if args.subparser_name == "minimize":
         if (args.enable_input_seq_pass or args.enable_input_diff_pass) and not args.input_outdir:
             raise SystemExit("ERROR: Passes --enable-input-seq-pass and --enable-input-diff-pass \n"
@@ -472,6 +513,7 @@ def main() -> int:  # pylint: disable=r0911,r0912,r0915  # this function is nece
         )
         return 0
 
+    # ISA 规范下载模式 - 下载指定架构的指令集规范文件
     if args.subparser_name == "download_spec":
         get_downloader(args.architecture, args.extensions, args.outfile).run()  # type: ignore
         return 0

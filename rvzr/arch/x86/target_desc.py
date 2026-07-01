@@ -1,5 +1,12 @@
 """
+文件: x86架构特定的常量和列表定义
 File: x86-specific constants and lists
+
+本模块定义了x86架构的目标描述(Target Description)，包括：
+- 寄存器名称、大小、归一化映射
+- 页表项(PTE)位定义及EPT/NPT扩展
+- 内存地址前缀（如byte ptr, word ptr等）
+- Unicorn模拟器中的x86寄存器常量映射
 
 Copyright (C) Microsoft Corporation
 SPDX-License-Identifier: MIT
@@ -14,8 +21,21 @@ from rvzr.target_desc import TargetDesc, CPUDesc, UnicornTargetDesc, PTEBitNameM
 
 
 class X86TargetDesc(TargetDesc):
-    """ Target description for x86 architecture. """
+    """
+    x86架构的目标描述类。
 
+    继承自通用TargetDesc，提供x86架构特有的寄存器定义、页表位映射
+    以及内存操作相关的常量。用于支持测试用例生成器、汇编解析器和模拟器
+    对x86架构的适配。
+
+    主要功能：
+    - 定义x86寄存器及其位宽映射
+    - 寄存器归一化（将不同尺寸的同源寄存器映射到统一标识符）
+    - 页表项(PTE)和扩展页表(EPT/NPT)的位偏移与默认值
+    - 根据CPU厂商(Intel/AMD)选择相应的VM页表位定义
+    """
+
+    # 寄存器位宽映射：每个x86寄存器名到其位宽大小(位)
     register_sizes = {
         "mm0": 64, "mm1": 64, "mm2": 64, "mm3": 64, "mm4": 64, "mm5": 64, "mm6": 64, "mm7": 64,
         "xmm0": 128, "xmm1": 128, "xmm2": 128, "xmm3": 128, "xmm4": 128, "xmm5": 128, "xmm6": 128,
@@ -37,6 +57,7 @@ class X86TargetDesc(TargetDesc):
         "ah": 8, "bh": 8, "ch": 8, "dh": 8,
     }  # yapf: disable
 
+    # 按位宽分组的寄存器列表：用于根据所需操作数大小查找可用寄存器
     registers_by_size = {
         8: ["al", "bl", "cl", "dl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b",
             "r14b", "r15b"],
@@ -50,6 +71,8 @@ class X86TargetDesc(TargetDesc):
         256: ["ymm0", "ymm1", "ymm2", "ymm3", "ymm4", "ymm5", "ymm6", "ymm7"],
     }  # yapf: disable
 
+    # 寄存器归一化映射：将不同尺寸的同源寄存器（如rax/eax/ax/al）映射到统一标识符（如"A"）
+    # 用于判断两个不同名称的寄存器是否指向同一物理寄存器
     reg_normalized = {
         "rax": "A", "eax": "A", "ax": "A", "al": "A", "ah": "A",
         "rbx": "B", "ebx": "B", "bx": "B", "bl": "B", "bh": "B",
@@ -124,6 +147,8 @@ class X86TargetDesc(TargetDesc):
         "tscaux": "TSCAUX",
     }  # yapf: disable
 
+    # 寄存器反归一化映射：将归一化标识符映射回具体尺寸的寄存器名
+    # 用于将归一化的寄存器标识转换为特定宽度的实际寄存器名
     reg_denormalized = {
         "A": {64: "rax", 32: "eax", 16: "ax", 8: "al"},
         "B": {64: "rbx", 32: "ebx", 16: "bx", 8: "bl"},
@@ -167,8 +192,11 @@ class X86TargetDesc(TargetDesc):
         "YMM7": {256: "ymm7"}
     }  # yapf: disable
 
+    # 可用作内存索引的寄存器列表（用于生成内存操作数地址计算）
     mem_index_registers = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi"]
 
+    # 页属性到PTE位名称的映射：将语义化的属性名映射到PTE中的具体位名及反转标志
+    # 例如 "executable" 映射到 "non_executable"，反转标志为True（表示逻辑相反）
     page_property_to_pte_bit_name = {
         "present": ("present", False),
         "writable": ("writable", False),
@@ -181,8 +209,9 @@ class X86TargetDesc(TargetDesc):
         "reserved_bit": ("reserved_bit", False),
     }
 
+    # x86标准页表项(PTE)位定义：名称到(位偏移, 默认值)的映射
     pte_bits: Dict[PTEBitName, Tuple[PTEBitOffset, bool]] = {
-        # NAME: (position, default value)
+        # 名称: (位位置, 默认值)
         "present": (0, True),
         "writable": (1, True),
         "user": (2, False),
@@ -194,6 +223,7 @@ class X86TargetDesc(TargetDesc):
         "non_executable": (63, True),
     }
 
+    # 页属性到Intel EPT位名称的映射
     _page_property_to_epte_bit_name: PTEBitNameMapper = {
         "present": ("present", False),
         "writable": ("writable", False),
@@ -204,8 +234,10 @@ class X86TargetDesc(TargetDesc):
         "reserved_bit": ("reserved_bit", False),
     }
 
+    # Intel扩展页表(EPT)位定义：名称到(位偏移, 默认值)的映射
+    # EPT与标准PTE的位布局不同，例如可执行位在第2位而非第63位
     _epte_bits_intel: Dict[PTEBitName, Tuple[PTEBitOffset, bool]] = {
-        # NAME: (position, default value)
+        # 名称: (位位置, 默认值)
         "present": (0, True),
         "writable": (1, True),
         "executable": (2, False),
@@ -215,6 +247,7 @@ class X86TargetDesc(TargetDesc):
         "reserved_bit": (51, False),
     }
 
+    # 页属性到AMD NPT位名称的映射
     _page_property_to_npte_bit_name: PTEBitNameMapper = {
         "present": ("present", False),
         "writable": ("writable", False),
@@ -225,8 +258,10 @@ class X86TargetDesc(TargetDesc):
         "reserved_bit": ("reserved_bit", False),
     }
 
+    # AMD嵌套页表(NPT)位定义：名称到(位偏移, 默认值)的映射
+    # NPT布局与Intel EPT不同，使用与标准PTE类似的位排列
     _npte_bits_amd: Dict[PTEBitName, Tuple[PTEBitOffset, bool]] = {
-        # NAME: (position, default value)
+        # 名称: (位位置, 默认值)
         "present": (0, True),
         "writable": (1, True),
         "user": (2, True),
@@ -236,6 +271,8 @@ class X86TargetDesc(TargetDesc):
         "non_executable": (63, True),
     }
 
+    # 内存操作数地址前缀映射：不同位宽的内存访问对应的汇编前缀
+    # 例如8位内存访问使用"byte ptr"，128位使用"xmmword ptr"
     memory_addr_prefixes: Final[Dict[int, str]] = {
         8: "byte ptr",
         16: "word ptr",
@@ -249,13 +286,22 @@ class X86TargetDesc(TargetDesc):
     }
 
     def __init__(self) -> None:
+        """
+        初始化x86目标描述。
+
+        根据被测CPU和配置调整目标参数：
+        - 过滤被阻止的寄存器
+        - 构建CPU描述（厂商、型号、系列、步进）
+        - 根据厂商选择VM页表位定义（Intel用EPT，AMD用NPT）
+        - 连接Unicorn模拟器目标描述
+        """
         super().__init__()
 
-        # modify/set target parameters based on the CPU under test and the configuration
+        # 根据被测CPU和配置修改/设置目标参数
         self.registers_by_size = self._filter_blocked_registers()
         self.cpu_desc = self._build_cpu_desc()
 
-        # Select VM page table bits and property mapping based on vendor
+        # 根据CPU厂商选择VM页表位和属性映射
         if self.cpu_desc.vendor == 'Intel':
             self.vm_pte_bits = self._epte_bits_intel
             self.page_property_to_vm_pte_bit_name = self._page_property_to_epte_bit_name
@@ -263,18 +309,38 @@ class X86TargetDesc(TargetDesc):
             self.vm_pte_bits = self._npte_bits_amd
             self.page_property_to_vm_pte_bit_name = self._page_property_to_npte_bit_name
 
-        # connect Unicorn TD
+        # 连接Unicorn目标描述
         self.uc_target_desc = X86UnicornTargetDesc()
 
     @staticmethod
     def is_unconditional_branch(inst: Instruction) -> bool:
+        """
+        判断指令是否为无条件分支指令。
+
+        :param inst: 待判断的指令对象
+        :return: 若为无条件分支返回True，否则False
+        """
         return inst.category == "BASE-UNCOND_BR"
 
     @staticmethod
     def is_call(inst: Instruction) -> bool:
+        """
+        判断指令是否为函数调用指令。
+
+        :param inst: 待判断的指令对象
+        :return: 若为CALL指令返回True，否则False
+        """
         return inst.category == "BASE-CALL"
 
     def _build_cpu_desc(self) -> CPUDesc:
+        """
+        从/proc/cpuinfo构建CPU描述对象。
+
+        解析CPU信息文件获取厂商、系列(family)、型号(model)和步进(stepping)信息。
+        若厂商不是Intel或AMD，返回默认的零值描述。
+
+        :return: 包含厂商、型号、系列和步进信息的CPUDesc对象
+        """
         vendor = self.get_vendor()
         if vendor not in ["Intel", "AMD"]:
             return CPUDesc(vendor, 0, 0, 0)
@@ -282,14 +348,17 @@ class X86TargetDesc(TargetDesc):
         with open("/proc/cpuinfo", "r") as f:
             cpuinfo = f.read()
 
+            # 解析CPU family（系列号）
             family_match = re.search(r"cpu family\s+:\s+(.*)", cpuinfo)
             assert family_match, "Failed to find family in /proc/cpuinfo"
             family = int(family_match.group(1), 16)
 
+            # 解析CPU model（型号号）
             model_match = re.search(r"model\s+:\s+(.*)", cpuinfo)
             assert model_match, "Failed to find model name in /proc/cpuinfo"
             model = int(model_match.group(1), 16)
 
+            # 解析CPU stepping（步进号）
             stepping_match = re.search(r"stepping\s+:\s+(.*)", cpuinfo)
             assert stepping_match, "Failed to find stepping in /proc/cpuinfo"
             stepping = int(stepping_match.group(1), 16)
@@ -298,18 +367,28 @@ class X86TargetDesc(TargetDesc):
 
 
 class X86UnicornTargetDesc(UnicornTargetDesc):  # pylint: disable=too-few-public-methods
-    """ x86 target description in the context of a Unicorn-based model. """
+    """
+    x86架构在Unicorn模拟器上下文中的目标描述类。
 
+    定义了Unicorn模拟器中可用的x86寄存器常量映射，以及
+    寄存器名称字符串到Unicorn常量、归一化标识符到Unicorn常量的映射。
+    用于在模拟器中读写寄存器值和构建模拟状态。
+    """
+
+    # Unicorn中可用的通用寄存器常量列表
     usable_registers: List[int] = [
         ucc.UC_X86_REG_RAX, ucc.UC_X86_REG_RBX, ucc.UC_X86_REG_RCX, ucc.UC_X86_REG_RDX,
         ucc.UC_X86_REG_RSI, ucc.UC_X86_REG_RDI, ucc.UC_X86_REG_EFLAGS, ucc.UC_X86_REG_RSP
     ]
 
+    # Unicorn中可用的128位SIMD寄存器常量列表
     usable_simd128_registers: List[int] = [
         ucc.UC_X86_REG_XMM0, ucc.UC_X86_REG_XMM1, ucc.UC_X86_REG_XMM2, ucc.UC_X86_REG_XMM3,
         ucc.UC_X86_REG_XMM4, ucc.UC_X86_REG_XMM5, ucc.UC_X86_REG_XMM6, ucc.UC_X86_REG_XMM7
     ]
 
+    # 寄存器名称字符串到Unicorn常量的映射
+    # 用于将汇编中的寄存器名转换为Unicorn API所需的常量ID
     reg_str_to_constant = {
         "al": ucc.UC_X86_REG_AL,
         "bl": ucc.UC_X86_REG_BL,
@@ -357,6 +436,9 @@ class X86UnicornTargetDesc(UnicornTargetDesc):  # pylint: disable=too-few-public
         "xmm7": ucc.UC_X86_REG_XMM7
     }
 
+    # 归一化寄存器标识符到Unicorn常量的映射
+    # 用于将归一化后的寄存器标识（如"A", "FLAGS"等）转换为Unicorn常量
+    # 值为-1的条目表示Unicorn不支持直接读写该寄存器
     reg_norm_to_constant = {
         "A": ucc.UC_X86_REG_RAX,
         "B": ucc.UC_X86_REG_RBX,
@@ -426,7 +508,9 @@ class X86UnicornTargetDesc(UnicornTargetDesc):  # pylint: disable=too-few-public
         "TSCAUX": -1,
     }
 
+    # 内存屏障指令列表（用于在测试用例中插入序列化操作）
     barriers: List[str] = ['mfence', 'lfence']
+    # 特殊寄存器常量：标志寄存器、程序计数器、栈指针、Actor基址寄存器
     flags_register: int = ucc.UC_X86_REG_EFLAGS
     pc_register: int = ucc.UC_X86_REG_RIP
     sp_register: int = ucc.UC_X86_REG_RSP

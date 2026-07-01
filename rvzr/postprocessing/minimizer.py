@@ -1,6 +1,13 @@
-""" File: Entry point for the postprocessing module.
-    It selects the appropriate minimization passes based on the command-line arguments,
-    and then runs them.
+"""
+文件：后处理模块的入口点。
+根据命令行参数选择适当的最小化pass，然后依次执行它们。
+
+执行顺序：
+1. 重现违规
+2. 运行输入最小化pass（减少输入数量和差异）
+3. 运行指令最小化pass（移除/简化指令）
+4. 运行分析pass（添加注释等）
+5. 存储结果
 
 Copyright (C) Microsoft Corporation
 SPDX-License-Identifier: MIT
@@ -29,76 +36,85 @@ from .progress_printer import ProgressPrinter
 if TYPE_CHECKING:
     from ..isa_spec import InstructionSet
 
-TMP_DIR = "/tmp/rvzr_minimize"
+TMP_DIR = "/tmp/rvzr_minimize"  # 临时文件目录
 
 
 class PassDesc(NamedTuple):
-    """ A named tuple to store the minimization pass description """
+    """ 存储最小化pass描述的命名元组，包含pass类和是否为分析pass的标记 """
     cls_: Type[BaseInstructionMinimizationPass | BaseInputMinimizationPass]
     is_analysis_pass: bool
 
 
 class Minimizer:
     """
-    Main class for the postprocessing module. It selects the appropriate minimization passes
-    based on the command-line arguments, and then runs them.
+    后处理模块的主类。根据命令行参数选择适当的最小化pass并执行它们。
+
+    支持的pass包括：
+    - 指令pass：移除、简化、NOP替换、常数简化、掩码简化、标签移除、屏障插入
+    - 输入pass：输入序列最小化、差异输入最小化
+    - 分析pass：违规注释插入
+
+    执行流程：重现违规 -> 输入pass -> 指令pass -> 分析pass -> 存储结果
     """
 
     ignore_list: List[int]
-    """ List of input IDs that will be ignored during minimization """
+    """ 最小化过程中忽略的输入ID列表 """
 
     pass_map: Dict[str, PassDesc]
-    """ Mapping of pass names to their classes """
+    """ pass名称到其类的映射字典 """
 
     _instruction_passes: List[Type[BaseInstructionMinimizationPass]]
     _input_passes: List[Type[BaseInputMinimizationPass]]
     _analysis_passes: List[Type[BaseInstructionMinimizationPass]]
 
     def __init__(self, fuzzer: Fuzzer, instruction_set_spec: InstructionSet):
+        """
+        初始化最小化器。
+        :param fuzzer: 模糊测试器实例
+        :param instruction_set_spec: 指令集规范
+        """
         self._fuzzer = fuzzer
         self._progress = ProgressPrinter()
         self.instruction_set_spec = instruction_set_spec
         self.ignore_list = []
 
-        # manage tmp directory
+        # 创建临时目录
         if not os.path.exists(TMP_DIR):
             os.makedirs(TMP_DIR)
 
-        # initialize the pass map
+        # 初始化pass映射表
         self.pass_map = {
-            "instruction_pass": PassDesc(InstructionRemovalPass, False),
-            "simplification_pass": PassDesc(InstructionSimplificationPass, False),
-            "nop_pass": PassDesc(NopReplacementPass, False),
-            "constant_pass": PassDesc(ConstantSimplificationPass, False),
-            "mask_pass": PassDesc(MaskSimplificationPass, False),
-            "label_pass": PassDesc(LabelRemovalPass, False),
-            "fence_pass": PassDesc(FenceInsertionPass, True),
-            "input_seq_pass": PassDesc(InputSequenceMinimizationPass, False),
-            "input_diff_pass": PassDesc(DifferentialInputMinimizerPass, False),
-            "comment_pass": PassDesc(AddViolationCommentsPass, True),
+            "instruction_pass": PassDesc(InstructionRemovalPass, False),      # 指令移除pass
+            "simplification_pass": PassDesc(InstructionSimplificationPass, False),  # 指令简化pass
+            "nop_pass": PassDesc(NopReplacementPass, False),                  # NOP替换pass
+            "constant_pass": PassDesc(ConstantSimplificationPass, False),     # 常数简化pass
+            "mask_pass": PassDesc(MaskSimplificationPass, False),             # 掩码简化pass
+            "label_pass": PassDesc(LabelRemovalPass, False),                  # 标签移除pass
+            "fence_pass": PassDesc(FenceInsertionPass, True),                 # 屏障插入pass（分析pass）
+            "input_seq_pass": PassDesc(InputSequenceMinimizationPass, False), # 输入序列最小化pass
+            "input_diff_pass": PassDesc(DifferentialInputMinimizerPass, False),  # 差异输入最小化pass
+            "comment_pass": PassDesc(AddViolationCommentsPass, True),         # 违规注释插入pass（分析pass）
         }
 
     def __del__(self) -> None:
-        # remove tmp directory
+        """ 析构函数：删除临时目录 """
         if os.path.exists(TMP_DIR):
             shutil.rmtree(TMP_DIR)
 
     def run(self, test_case_asm: str, n_inputs: int, test_case_outfile: str, input_outdir: str,
             n_attempts: int, **enabled_passes: Any) -> None:
         """
-        Run the minimization passes based on the command-line arguments, passed as arguments
-        to this function. It first reproduces the violation, then run input passes,
-        then instruction passes, and finally the analysis passes. The resulting minimized program
-        is stored into `test_case_outfile` and the resulting minimized input sequence is stored
-        into `input_outdir`.
+        根据命令行参数运行最小化pass。
+        首先重现违规，然后运行输入pass，再运行指令pass，最后运行分析pass。
+        最小化后的程序存储到test_case_outfile，输入序列存储到input_outdir。
 
-        :param test_case_asm: Path to the test case assembly file
-        :param n_inputs: Number of inputs to use during the minimization
-        :param test_case_outfile: Path to store the minimized test case
-        :param input_outdir: Path to store the minimized inputs
-        :param n_attempts: Number of attempts to run the instruction minimization passes
-        :param enabled_passes: Dictionary of arguments to enable/disable the passes.
-               Supported keys:
+        :param test_case_asm: 测试用例汇编文件路径
+        :param n_inputs: 最小化过程中使用的输入数量
+        :param test_case_outfile: 存储最小化测试用例的路径
+        :param input_outdir: 存储最小化输入的路径
+        :param n_attempts: 指令最小化pass的运行次数
+        :param enabled_passes: 启用/禁用pass的参数字典。
+               支持的键：
                - enable_instruction_pass
                - enable_simplification_pass
                - enable_nop_pass
@@ -113,78 +129,84 @@ class Minimizer:
         """
         self._reset(enabled_passes)
 
-        # Parse the test case and inputs
+        # 解析测试用例和生成输入
         test_case = self._fuzzer.asm_parser.parse_file(test_case_asm, self._fuzzer.code_gen,
                                                        self._fuzzer.elf_parser)
         inputs = self._fuzzer.data_gen.generate(n_inputs, n_actors=test_case.n_actors())
 
-        # Check if the violation can be reproduced
+        # 检查违规是否可以重现
         violation = self._reproduce_org_violation(test_case, inputs)
         if not violation:
             return
 
-        # Run the input minimization passes
+        # 运行输入最小化pass
         if self._input_passes:
             new_inputs = self._run_input_passes(test_case, inputs, violation, input_outdir)
 
-            # Check if the violation can be reproduced with the new inputs
+            # 检查使用新输入后违规是否仍可重现
             new_violation = self._fuzzer.fuzzing_round(test_case, inputs, [])
             if new_violation:
-                # Use new inputs in future passes
+                # 使用新输入进行后续pass
                 inputs = new_inputs
                 violation = new_violation
 
-                # Disable boosting from now on:
-                # The minimized input sequence is now guaranteed to be boosted
+                # 从现在起禁用输入增强：最小化后的输入序列已保证被增强
                 CONF.inputs_per_class = 1
             else:
                 warning("postprocessor", "Non-reproducible input sequence minimization. Reverting")
 
-        # Set the non-violating inputs as the ignore list
+        # 设置非违规输入为忽略列表
         violating_ids = [m.input_id for m in violation.measurements]
         self.ignore_list = \
             [i for i in range(len(violation.input_sequence)) if i not in violating_ids]
         self._progress.pass_msg(f"Violating input IDs: {violating_ids}")
 
-        # Run the instruction minimization passes
+        # 运行指令最小化pass（可多次迭代）
         for attempt in range(n_attempts):
             self._progress.global_msg(f"Minimization attempt {attempt + 1}/{n_attempts}")
             old_tc = deepcopy(test_case)
             test_case = self._run_instruction_passes(test_case, inputs, violation,
                                                      test_case_outfile)
-            if test_case == old_tc:  # break if no progress was made
+            if test_case == old_tc:  # 如果没有进展则停止
                 break
 
-        # Run the analysis passes
+        # 运行分析pass
         test_case = self._run_analysis_passes(test_case, inputs, violation, test_case_outfile)
 
-        # Get rid of unused labels
+        # 清除未使用的标签
         if enabled_passes.get("enable_label_pass", False):
             self._instruction_passes = [LabelRemovalPass]
             test_case = self._run_instruction_passes(test_case, inputs, violation,
                                                      test_case_outfile)
 
-        # Store the results
+        # 存储结果
         self._progress.pass_start("Storing the results")
         test_case.save(test_case_outfile)
 
     def _reset(self, enabled_passes: Dict[str, Any]) -> None:
-        # Get lists of enabled passes
+        """ 重置最小化器状态：设置启用的pass、清空忽略列表、调整采样大小和日志配置 """
+        # 获取启用的pass列表
         self._set_passes(enabled_passes)
 
-        # Reset the ignore list
+        # 清空忽略列表
         self.ignore_list = []
 
-        # Adjust the sample size to reduce non-reproducibility
+        # 调整采样大小以减少不可重现性
         CONF.executor_sample_sizes = [CONF.executor_sample_sizes[-1]]
 
-        # Make sure that fuzzing progress is not printed
+        # 禁用模糊测试进度信息的打印
         if "info" in CONF.logging_modes:
             CONF.logging_modes.remove("info")
             update_logging_after_config_change()
 
     def _reproduce_org_violation(self, test_case: TestCaseProgram,
                                  inputs: List[InputData]) -> Optional[Violation]:
+        """
+        尝试重现原始违规。多次重试以提高成功率。
+        :param test_case: 测试用例对象
+        :param inputs: 输入列表
+        :return: 重现的违规对象，如果无法重现则返回None
+        """
         self._progress.pass_start("Reproducing the violation")
         for _ in range(CONF.minimizer_retries):
             violation = self._fuzzer.fuzzing_round(test_case, inputs, [])
@@ -195,6 +217,10 @@ class Minimizer:
         return None
 
     def _set_passes(self, enabled_passes: Dict[str, Any]) -> None:
+        """
+        根据启用参数设置输入pass、指令pass和分析pass列表。
+        :param enabled_passes: 启用/禁用pass的参数字典
+        """
         passes: List[PassDesc] = \
             [v for k, v in self.pass_map.items() if enabled_passes.get(f"enable_{k}", False)]
         self._input_passes = [
@@ -213,17 +239,25 @@ class Minimizer:
 
     def _run_input_passes(self, test_case: TestCaseProgram, inputs: List[InputData],
                           org_violation: Violation, outdir: str) -> List[InputData]:
+        """
+        运行所有启用的输入最小化pass。
+        :param test_case: 测试用例对象
+        :param inputs: 输入列表
+        :param org_violation: 原始违规对象
+        :param outdir: 输入输出目录
+        :return: 最小化后的输入列表
+        """
         violation = org_violation
 
         for pass_cls in self._input_passes:
-            # Create the pass object
+            # 创建pass对象
             pass_ = pass_cls(self._fuzzer, self.instruction_set_spec, self._progress)
             self._progress.pass_start(pass_.name)
 
-            # Run the pass
+            # 运行pass
             new_inputs = pass_.run(test_case, inputs, violation)
 
-            # Recreate the violation with the new input sequence
+            # 用新输入序列重新验证违规
             new_violation = self._fuzzer.fuzzing_round(test_case, new_inputs, [])
             if new_violation:
                 violation = new_violation
@@ -232,7 +266,7 @@ class Minimizer:
                 self._progress.pass_msg("[WARNING] Non-reproducible sequence minimization"
                                         ". Rolling back to the previous state")
 
-        # Create the output directory, if not already exists
+        # 创建输出目录（如果不存在）
         if outdir and not os.path.exists(outdir):
             try:
                 os.makedirs(outdir)
@@ -240,7 +274,7 @@ class Minimizer:
                 error(f"Creation of the directory {outdir} failed")
             outdir = os.path.abspath(outdir)
 
-        # Store the results
+        # 存储最小化后的输入
         self._progress.pass_msg(f"Saving new inputs in '{outdir}'")
         for i, input_ in enumerate(inputs):
             input_.save(f"{outdir}/min_input_{i:04}.bin")
@@ -249,14 +283,22 @@ class Minimizer:
 
     def _run_instruction_passes(self, test_case: TestCaseProgram, inputs: List[InputData],
                                 org_violation: Violation, outfile: str) -> TestCaseProgram:
-        # create pass objects
+        """
+        运行所有启用的指令最小化pass。
+        :param test_case: 测试用例对象
+        :param inputs: 输入列表
+        :param org_violation: 原始违规对象
+        :param outfile: 输出文件路径
+        :return: 最小化后的测试用例
+        """
+        # 创建pass对象
         passes = self._instruction_passes
         pass_objs = [c(self._fuzzer, self.instruction_set_spec, self._progress) for c in passes]
         for pass_obj in pass_objs:
             pass_obj.set_ignore_list(self.ignore_list)
             pass_obj.set_violation(org_violation)
 
-        # run passes
+        # 运行每个pass
         for pass_obj in pass_objs:
             self._progress.pass_start(pass_obj.name)
             test_case = pass_obj.run(test_case, inputs)
@@ -266,14 +308,22 @@ class Minimizer:
 
     def _run_analysis_passes(self, test_case: TestCaseProgram, inputs: List[InputData],
                              org_violation: Violation, outfile: str) -> TestCaseProgram:
-        # create pass objects
+        """
+        运行所有启用的分析pass。
+        :param test_case: 测试用例对象
+        :param inputs: 输入列表
+        :param org_violation: 原始违规对象
+        :param outfile: 输出文件路径
+        :return: 分析后的测试用例
+        """
+        # 创建pass对象
         passes = self._analysis_passes
         pass_objs = [c(self._fuzzer, self.instruction_set_spec, self._progress) for c in passes]
         for pass_obj in pass_objs:
             pass_obj.set_ignore_list(self.ignore_list)
             pass_obj.set_violation(org_violation)
 
-        # run passes
+        # 运行每个分析pass
         for pass_obj in pass_objs:
             self._progress.pass_start(pass_obj.name)
             test_case = pass_obj.run(test_case, inputs)

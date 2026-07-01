@@ -1,5 +1,17 @@
 """
-File: Global classes that provide service to all Revizor modules
+文件：全局日志基础设施 - 为所有 Revizor 模块提供日志与调试输出服务
+
+本模块实现了侧信道模糊测试框架的日志系统，包括：
+- _LoggingConfig：基于 Borg 模式的全局日志配置管理类
+- 基础日志函数：error、warning、inform、dbg
+- FuzzLogger：模糊测试器专用日志类（进度条、阶段报告、违规报告）
+- ModelLogger：合约模型专用日志类（指令追踪、内存访问、推测回滚、异常）
+- GeneratorLogger：程序生成器专用日志类（指令池调试输出）
+- ExecutorLogger：执行器专用日志类（原始追踪输出）
+- ISALogger：ISA 规范专用日志类（指令过滤原因输出）
+
+所有日志类通过 _LoggingConfig 共享日志模式配置，支持彩色输出和
+多行/单行重绘两种显示模式。
 
 Copyright (C) Microsoft Corporation
 SPDX-License-Identifier: MIT
@@ -24,9 +36,10 @@ if TYPE_CHECKING:
     from .traces import HTrace, Violation, CTrace
     from .tc_components.test_case_data import InputData
 
-MASK_64BIT = pow(2, 64)
-POW2_64 = pow(2, 64)
+MASK_64BIT = pow(2, 64)   # 64位掩码常量
+POW2_64 = pow(2, 64)      # 2的64次方常量
 
+# ANSI 终端颜色代码定义
 RED = '\033[33;31m'
 GREEN = '\033[33;32m'
 YELLOW = '\033[33;33m'
@@ -36,57 +49,65 @@ CYAN = '\033[33;36m'
 GRAY = '\033[33;37m'
 COL_RESET = "\033[0m"
 
-M_COL = PURPLE
-PC_COL = COL_RESET
-VAL_COL = CYAN
+# 模型追踪输出的颜色配置
+M_COL = PURPLE     # 内存访问标记颜色
+PC_COL = COL_RESET  # PC（程序计数器）颜色
+VAL_COL = CYAN      # 值颜色
 
-HTRACE_R1_COL = CYAN
-HTRACE_R2_COL = YELLOW
+# 硬件追踪对比输出的颜色配置
+HTRACE_R1_COL = CYAN    # 硬件追踪行1颜色
+HTRACE_R2_COL = YELLOW  # 硬件追踪行2颜色
 
-STAT = FuzzingStats()
+STAT = FuzzingStats()  # 全局模糊测试统计对象
 
 
 # ==================================================================================================
-# Private: Logging configuration
+# 内部：日志配置管理
 # ==================================================================================================
 class _LoggingConfig:  # pylint: disable=too-few-public-methods  # because this is a data class
     """
-    A global object responsible for keeping track of how stuff should be printed.
-    This object is shared among all modules (via Borg pattern)
-    and is used to determine the logging behavior.
+    全局日志配置管理类 - 使用 Borg 模式确保所有实例共享同一状态。
+
+    该类负责跟踪日志输出模式（info/stat/debug 等）和显示方式
+    （单行重绘/多行输出），由 CONF.logging_modes 配置项驱动。
+
+    所有日志类（FuzzLogger、ModelLogger 等）通过创建 _LoggingConfig 实例
+    获取配置，由于 Borg 模式，它们实际上共享同一配置状态。
     """
-    _borg_shared_state: Dict[Any, Any] = {}
+    _borg_shared_state: Dict[Any, Any] = {}  # Borg 模式共享状态
 
-    redraw_mode: bool = True
-    line_ending: str = ""
+    redraw_mode: bool = True       # 是否使用单行重绘模式（进度条等）
+    line_ending: str = ""          # 行尾字符（重绘模式为空，多行模式为换行）
 
-    # info modes
-    info: bool = False
-    stat: bool = False
-    debug: bool = False
+    # 信息模式开关
+    info: bool = False             # 是否显示信息级别日志
+    stat: bool = False             # 是否显示统计信息
+    debug: bool = False            # 是否启用任何调试模式
 
-    # debugging specific modules
-    dbg_timestamp: bool = False
-    dbg_violation: bool = False
-    dbg_dump_htraces: bool = False
-    dbg_dump_ctraces: bool = False
-    dbg_dump_traces_unlimited: bool = False
-    dbg_executor_raw: bool = False
-    dbg_model: bool = False
-    dbg_coverage: bool = False
-    dbg_generator: bool = False
-    dbg_priming: bool = False
-    dbg_isa_filter: bool = False
+    # 各模块的调试开关
+    dbg_timestamp: bool = False      # 时间戳调试
+    dbg_violation: bool = False      # 违规详细信息调试
+    dbg_dump_htraces: bool = False   # 硬件追踪转储调试
+    dbg_dump_ctraces: bool = False   # 合约追踪转储调试
+    dbg_dump_traces_unlimited: bool = False  # 无限制追踪转储
+    dbg_executor_raw: bool = False   # 执行器原始数据调试
+    dbg_model: bool = False          # 模型执行追踪调试
+    dbg_coverage: bool = False       # 覆盖率调试
+    dbg_generator: bool = False      # 程序生成器调试
+    dbg_priming: bool = False        # priming 阶段调试
+    dbg_isa_filter: bool = False     # ISA 指令过滤调试
 
-    dbg_model_print_id: bool = True
+    dbg_model_print_id: bool = True  # 模型调试中是否打印输入 ID
 
     _all_modes: List[str] = [
         "info", "stat", "dbg_timestamp", "dbg_violation", "dbg_dump_htraces", "dbg_dump_ctraces",
         "dbg_dump_traces_unlimited", "dbg_executor_raw", "dbg_model", "dbg_coverage",
         "dbg_generator", "dbg_priming", "dbg_isa_filter"
     ]
+    """所有合法的日志模式名称列表"""
 
     def __init__(self) -> None:
+        """初始化日志配置 - 实现 Borg 模式使所有实例共享同一状态"""
         self.__dict__ = self._borg_shared_state
         if not self._borg_shared_state:
             self.update_logging_modes()
@@ -95,25 +116,30 @@ class _LoggingConfig:  # pylint: disable=too-few-public-methods  # because this 
 
     def update_logging_modes(self) -> None:
         """
-        Function that adjust the logging configuration after
-        a change has been made to the CONF object """
-        # Check that all entries in the config a valid
+        根据 CONF.logging_modes 更新日志配置模式。
+
+        处理逻辑：
+        1. 验证所有配置的日志模式名称是否合法
+        2. 设置各模式开关（info/stat/各 dbg 模式）
+        3. 若需要调试模式但 Python 运行在优化模式（-O），发出警告
+        """
+        # 验证配置中的日志模式名称是否合法
         for mode in CONF.logging_modes:
-            if not mode:  # skip empty values
+            if not mode:  # 跳过空值
                 continue
             if mode not in self._all_modes:
                 error(f"Unknown value '{mode}' of config variable 'logging_modes'")
 
-        # Set the logging modes
+        # 设置各日志模式开关
         self.debug = False
         for mode in self._all_modes:
-            val = mode in CONF.logging_modes
+            val = mode in CONF.logging_modes  # 检查该模式是否在配置中启用
             setattr(self, mode, val)
             if "dbg" in mode:
-                self.debug |= val
+                self.debug |= val  # 任一 dbg 模式启用则 debug=True
 
-        # Check if Python is not running in optimized mode if debugging is required
-        # (otherwise, the debug messages won't be printed)
+        # 检查 Python 是否运行在优化模式（-O）下，
+        # 若需要调试模式但 Python 优化模式会跳过 __debug__ 相关代码
         if not __debug__:
             dbg_required = any([
                 self.dbg_timestamp, self.dbg_model, self.dbg_coverage, self.dbg_dump_htraces,
@@ -127,26 +153,33 @@ class _LoggingConfig:  # pylint: disable=too-few-public-methods  # because this 
 
 
 # ==================================================================================================
-# Public interface to logging configuration
+# 日志配置的公共接口
 # ==================================================================================================
-# create an initial instance of the logging configuration
-# to be used by functions in this module
+# 创建日志配置的初始实例供本模块的函数使用
 _LOG_CONF = _LoggingConfig()
 
 
 def update_logging_after_config_change() -> None:
-    """ Update the logging configuration after a change has been made to the CONF object """
+    """ 在 CONF 配置变更后更新日志配置 """
     _LOG_CONF.update_logging_modes()
 
 
 # ==================================================================================================
-# Public: Simple logging functions
+# 公共：基础日志函数
 # ==================================================================================================
-# FIXME: deprecated; use exceptions instead
+# FIXME: 已弃用；应使用异常代替
 def error(msg: str, print_tb: bool = False, print_last_tb: bool = False) -> NoReturn:
-    """ Print an error message and exit the program """
+    """打印错误消息并退出程序。
+
+    参数:
+        msg: 错误消息内容
+        print_tb: 是否打印完整调用栈追踪
+        print_last_tb: 是否打印最近3层调用栈追踪
+
+    该函数打印红色错误消息后以退出码 1 终止程序。
+    """
     if _LOG_CONF.redraw_mode:
-        print("")
+        print("")  # 重绘模式下先换行以清除进度条
 
     if print_tb:
         print("Encountered an unrecoverable error\nTraceback:")
@@ -165,7 +198,12 @@ def error(msg: str, print_tb: bool = False, print_last_tb: bool = False) -> NoRe
 
 
 def warning(src: str, msg: str) -> None:
-    """ Print a warning message """
+    """打印警告消息。
+
+    参数:
+        src: 警告来源模块名称
+        msg: 警告消息内容
+    """
     if _LOG_CONF.redraw_mode:
         print("")
     if CONF.color:
@@ -175,7 +213,13 @@ def warning(src: str, msg: str) -> None:
 
 
 def inform(src: str, msg: str, end: str = "\n") -> None:
-    """ Print a general information message """
+    """打印信息级别消息（仅在 info 模式启用时输出）。
+
+    参数:
+        src: 信息来源模块名称
+        msg: 信息消息内容
+        end: 行尾字符，默认为换行
+    """
     if _LOG_CONF.info:
         if _LOG_CONF.redraw_mode:
             print("")
@@ -183,7 +227,12 @@ def inform(src: str, msg: str, end: str = "\n") -> None:
 
 
 def dbg(src: str, msg: str) -> None:
-    """ Print a debug message """
+    """打印调试消息（仅在 debug 模式启用且 __debug__ 为 True 时输出）。
+
+    参数:
+        src: 调试来源模块名称
+        msg: 调试消息内容
+    """
     if not __debug__:
         return
     if _LOG_CONF.debug:
@@ -193,27 +242,43 @@ def dbg(src: str, msg: str) -> None:
 
 
 # ==================================================================================================
-# Public: Module-specific logging
+# 公共：模糊测试器专用日志类
 # ==================================================================================================
 class FuzzLogger:
-    """ A class that provides logging services for the Fuzzer module """
+    """ 模糊测试器日志类 - 提供模糊测试循环的进度显示和阶段报告。
 
-    one_percent_progress: float = 0.0
-    progress: float = 0.0
-    progress_percent: int = 0
-    msg: str = ""
-    _msg_width: int = 0
-    start_time: datetime
-    _conf: Final[_LoggingConfig]
+    主要功能：
+    - 进度条更新（显示测试用例数量、百分比、简要统计）
+    - priming 阶段提示
+    - 推测嵌套层级增加提示
+    - 慢路径进入提示
+    - 超时提示
+    - 样本大小增加提示
+    - 违规检测报告
+    - 完成时的时间与统计报告
+    """
+
+    one_percent_progress: float = 0.0   # 每百分之一的进度增量
+    progress: float = 0.0               # 当前累计进度
+    progress_percent: int = 0           # 当前进度百分比整数
+    msg: str = ""                       # 当前进度条消息
+    _msg_width: int = 0                 # 进度条消息最大宽度（用于单行重绘）
+    start_time: datetime                # 模糊测试开始时间
+    _conf: Final[_LoggingConfig]        # 日志配置引用
 
     def __init__(self) -> None:
         self._conf = _LoggingConfig()
 
     # ----------------------------------------------------------------------------------------------
-    # Phases of the fuzzer
+    # 模糊测试各阶段的日志方法
 
     def reset(self, max_iterations: int, start_time: datetime) -> None:
-        """ Reset the state of the fuzzer """
+        """重置模糊测试器的日志状态。
+
+        参数:
+            max_iterations: 最大迭代次数（用于计算进度百分比）
+            start_time: 模糊测试开始时间
+        """
         self.one_percent_progress = max_iterations / 100
         self.progress = 0
         self.progress_percent = 0
@@ -221,18 +286,30 @@ class FuzzLogger:
         self.start_time = start_time
 
     def start(self, iterations: int, start_time: datetime) -> None:
-        """ Print the start message of the fuzzer (namely, the start time) """
+        """打印模糊测试开始消息（显示开始时间）。
+
+        参数:
+            iterations: 总迭代次数
+            start_time: 开始时间
+        """
         self.reset(iterations, start_time)
         if not self._conf.info:
             return
         inform("fuzzer", start_time.strftime('Starting at %H:%M:%S'))
 
     def start_round(self, round_id: int) -> None:
-        """ Update the progress bar for the next fuzzing round """
+        """更新模糊测试进度条。
+
+        在 info 模式启用时，每轮测试用例更新进度百分比和统计摘要。
+        在 dbg_timestamp 模式启用时，每 1000 轮打印时间戳。
+
+        参数:
+            round_id: 当前轮次编号
+        """
         if not self._conf.info:
             return
 
-        # Update the progress state
+        # 更新进度状态
         if STAT.test_cases > self.progress:
             self.progress += self.one_percent_progress
             self.progress_percent += 1
@@ -243,7 +320,7 @@ class FuzzLogger:
             msg += STAT.get_brief()
         self.msg = msg
 
-        # Print the progress bar
+        # 打印进度条
         if STAT.test_cases > 0:
             print(f"{self.msg:<{self._msg_width}}", end=self._conf.line_ending, flush=True)
         if self._conf.dbg_timestamp and round_id and round_id % 1000 == 0:
@@ -252,7 +329,11 @@ class FuzzLogger:
                 f" Duration: {(datetime.today() - self.start_time).total_seconds()} seconds")
 
     def priming(self, num_violations: int) -> None:
-        """ Print a message indicating that the fuzzer is in the priming phase """
+        """打印 priming 阶段提示消息。
+
+        参数:
+            num_violations: 当前检测到的违规数量
+        """
         if not self._conf.info:
             return
         msg = self.msg + f"> Priming  {num_violations}             "
@@ -260,7 +341,7 @@ class FuzzLogger:
         self._msg_width = max(self._msg_width, len(msg))
 
     def nesting_increased(self) -> None:
-        """ Print a message indicating that the model's nesting level has been increased """
+        """打印推测嵌套层级增加提示消息。"""
         if not self._conf.info:
             return
         msg = self.msg + f"> Nest   {CONF.model_max_nesting}         "
@@ -268,7 +349,7 @@ class FuzzLogger:
         print(msg, end=self._conf.line_ending, flush=True)
 
     def slow_path(self) -> None:
-        """ Print a message indicating that the fuzzer has entered the slow path """
+        """打印进入慢路径的提示消息。"""
         if not self._conf.info:
             return
         msg = self.msg + ">" + " Entering slow path..."
@@ -276,13 +357,17 @@ class FuzzLogger:
         print(msg, end=self._conf.line_ending, flush=True)
 
     def timeout(self) -> None:
-        """ Print a message indicating that the fuzzer has timed out """
+        """打印超时提示消息。"""
         if not self._conf.info:
             return
         inform("fuzzer", "\nTimeout expired")
 
     def sample_size_increase(self, sample_size: int) -> None:
-        """ Print a message indicating that the sample size has been increased """
+        """打印样本大小增加提示消息。
+
+        参数:
+            sample_size: 新的样本大小
+        """
         if not self._conf.info:
             return
         msg = self.msg + ">" + " Increasing sample size... to " + str(sample_size)
@@ -290,17 +375,20 @@ class FuzzLogger:
         print(msg, end=self._conf.line_ending, flush=True)
 
     def report_violations(self, violation: Violation) -> None:
-        """ Print the detected violations """
+        """打印检测到的违规的完整报告。
+
+        参数:
+            violation: 检测到的违规对象
+        """
         print("\n\n================================ Violations detected ==========================")
         print(violation.full_str())
 
     def finish(self) -> None:
-        """ Print the finish message of the fuzzer (namely, the finish
-        time and the duration of the fuzzer) """
+        """打印模糊测试完成消息（显示持续时间和结束时间，以及统计信息）。"""
         if not self._conf.info:
             return
         now = datetime.today()
-        print("")  # new line after the progress bar
+        print("")  # 进度条后换行
         if self._conf.stat:
             print("================================ Statistics ================================"
                   "===\n")
@@ -309,7 +397,11 @@ class FuzzLogger:
         print(datetime.today().strftime('Finished at %H:%M:%S'))
 
     def report_model_coverage(self, model: Model) -> None:
-        """ Save model coverage """
+        """保存模型覆盖率报告到文件。
+
+        参数:
+            model: 合约模型实例
+        """
         if not __debug__:
             return
         if not self._conf.dbg_coverage:
@@ -317,23 +409,34 @@ class FuzzLogger:
         model.report_coverage("coverage.txt")
 
     # ----------------------------------------------------------------------------------------------
-    # Debugging
+    # 调试方法
     def dbg_dump_traces(self, inputs: List[InputData], htraces: List[HTrace],
                         reference_htraces: List[HTrace], ctraces: List[CTrace]) -> None:
-        """ Print the collected traces """
+        """转储收集的追踪数据（硬件追踪和合约追踪）。
+
+        在 dbg_dump_htraces 或 dbg_dump_ctraces 模式启用时输出追踪详情。
+        可选限制输出到前 100 个输入（除非启用 dbg_dump_traces_unlimited）。
+        被损坏的硬件追踪会用参考追踪替换。
+
+        参数:
+            inputs: 输入数据列表
+            htraces: 硬件追踪列表
+            reference_htraces: 参考硬件追踪列表（用于替换损坏追踪）
+            ctraces: 合约追踪列表
+        """
         if not __debug__:
             return
         if not self._conf.dbg_dump_htraces and not self._conf.dbg_dump_ctraces:
             return
-        if not htraces:  # might be empty due to tracing errors
+        if not htraces:  # 可能因追踪错误而为空
             return
 
-        # Optionally trim the output
+        # 可选限制输出数量
         if len(inputs) > 100 and not self._conf.dbg_dump_traces_unlimited:
             warning("fuzzer", "Trace output is will be limited to 100 traces")
             inputs = inputs[:100]
 
-        # Replace corrupted traces with the reference traces
+        # 用参考追踪替换损坏的硬件追踪
         for i, htrace in enumerate(htraces):
             if htrace.is_corrupted_or_ignored() \
                and not reference_htraces[i].is_corrupted_or_ignored():
@@ -341,7 +444,7 @@ class FuzzLogger:
 
         print("\n================================ Collected Traces =============================")
         org_debug_state = self._conf.dbg_model
-        self._conf.dbg_model = False
+        self._conf.dbg_model = False  # 临时禁用模型调试以避免干扰追踪输出
         for i, _ in enumerate(inputs):
             print(f"- Input {i}:")
             colors: Tuple[str, ...]
@@ -357,11 +460,18 @@ class FuzzLogger:
                 print(f"  Feedback: {YELLOW}{htraces[i].get_max_pfc()}{COL_RESET}")
             else:
                 print(f"  Feedback: {htraces[i].get_max_pfc()}")
-        self._conf.dbg_model = org_debug_state
+        self._conf.dbg_model = org_debug_state  # 恢复模型调试状态
 
     def dbg_dump_architectural_traces(self, hardware_regs: List[List[int]],
                                       model_regs: List[List[int]]) -> None:
-        """ Print the architectural traces """
+        """转储架构级追踪（硬件寄存器值与模型寄存器值的对比）。
+
+        仅在 architectural 模式模糊测试且追踪转储调试模式启用时输出。
+
+        参数:
+            hardware_regs: 硬件寄存器值列表
+            model_regs: 模型寄存器值列表
+        """
         if not __debug__:
             return
         if CONF.fuzzer != "architectural":
@@ -381,7 +491,15 @@ class FuzzLogger:
                 print(f"  HW Registers:    {[hex(v) for v in hardware_regs[i]]}")
 
     def dbg_violation(self, violation: Violation, model: Model) -> None:
-        """ Print a detailed report of the violation """
+        """打印违规的详细追踪报告。
+
+        对每个硬件追踪类别，重新在模型中追踪测试用例，
+        输出每个输入的模型执行过程详情。
+
+        参数:
+            violation: 检测到的违规对象
+            model: 合约模型实例
+        """
         if not __debug__:
             return
 
@@ -393,14 +511,19 @@ class FuzzLogger:
                 measurement = hw_class.measurements[0]
                 print(f"                      ##### Input {measurement.input_id} #####")
                 model_debug_state = self._conf.dbg_model, self._conf.dbg_model_print_id
-                self._conf.dbg_model = True
+                self._conf.dbg_model = True       # 临时启用模型调试
                 self._conf.dbg_model_print_id = False
                 model.trace_test_case([measurement.input_], CONF.model_max_nesting)
                 self._conf.dbg_model, self._conf.dbg_model_print_id = model_debug_state
                 print("\n\n")
 
     def dbg_priming_progress(self, input_id: int, current_input_id: int) -> None:
-        """ Print a message indicating the progress of the priming phase """
+        """打印 priming 阶段的进度提示。
+
+        参数:
+            input_id: 用于 priming 的输入编号
+            current_input_id: 被替换的原始输入编号
+        """
         if not __debug__:
             return
         if not self._conf.dbg_priming:
@@ -409,7 +532,14 @@ class FuzzLogger:
 
     def dbg_priming_fail(self, input_id: int, current_input_id: int, htrace_to_reproduce: HTrace,
                          new_htrace: HTrace) -> None:
-        """ Print a message indicating that the priming phase has failed """
+        """打印 priming 失败的消息，对比原始追踪和新追踪。
+
+        参数:
+            input_id: 用于 priming 的输入编号
+            current_input_id: 被替换的原始输入编号
+            htrace_to_reproduce: 需要重现的原始硬件追踪
+            new_htrace: priming 后的新硬件追踪
+        """
         if not __debug__:
             return
         if not self._conf.dbg_priming:
@@ -422,22 +552,35 @@ class FuzzLogger:
 
 class ModelLogger:
     """
-    A class that provides logging services for the Model modules. Primarily, this class
-    is responsible for printing the debug trace of the model.
-    (printed when dbg_model or dbg_violation is set in the config file)
+    合约模型日志类 - 提供模型执行过程的调试追踪输出。
+
+    主要功能：
+    - 调试追踪头部（显示当前输入编号）
+    - 内存访问调试（显示加载/存储的地址和值）
+    - 指令执行调试（显示指令名称、寄存器值、推测状态）
+    - 推测回滚消息
+    - 异常消息
     """
 
-    model_layout: Optional[SandboxLayout] = None
+    model_layout: Optional[SandboxLayout] = None  # 模型沙箱布局（用于地址规范化）
 
     def __init__(self) -> None:
         self._conf = _LoggingConfig()
 
     def set_model_layout(self, layout: SandboxLayout) -> None:
-        """ Store the layout of the model being debugged """
+        """存储模型的沙箱布局（用于将地址转换为偏移量）。
+
+        参数:
+            layout: 模型的沙箱布局对象
+        """
         self.model_layout = layout
 
     def dbg_header(self, input_id: int) -> None:
-        """ Print the header of the debug information """
+        """打印调试追踪的头部信息（显示当前输入编号）。
+
+        参数:
+            input_id: 当前输入编号
+        """
         if not __debug__:
             return
         if not self._conf.dbg_model or not self._conf.dbg_model_print_id:
@@ -448,18 +591,18 @@ class ModelLogger:
     def dbg_mem_access(self, is_store: bool, value: int, address: int, size: int,
                        model: UnicornModel, layout: SandboxLayout) -> None:
         """
-        Print debug information about memory access, if debugging is enabled.
-        The information includes:
-            - Memory address (as an offset from the start of the main actor's data section)
-            - Type of access (load or store)
-            - Value being read or written
+        打印内存访问的调试信息。
 
-        :param type_: The type of memory access (UC_MEM_READ or UC_MEM_WRITE)
-        :param value: The value being read or written
-        :param address: The address being accessed
-        :param size: The size of the memory access
-        :param model: The model being debugged
-        :param layout: The layout of the model being debugged
+        显示内存地址（转换为数据区偏移量）、访问类型（加载/存储）、
+        读写值等信息。对存储操作直接显示传入的值，
+        对加载操作从模拟器内存中读取实际值。
+
+        :param is_store: 是否为存储操作（True 为 store，False 为 load）
+        :param value: 存储操作的写入值
+        :param address: 被访问的内存地址
+        :param size: 内存访问的字节大小
+        :param model: 被调试的合约模型实例
+        :param layout: 模型的沙箱布局
         :return: None
         """
         if not __debug__:
@@ -467,14 +610,14 @@ class ModelLogger:
         if not self._conf.dbg_model:
             return
 
-        # Address details
+        # 地址转换 - 将绝对地址转换为数据区偏移量便于理解
         normalized_address = layout.data_addr_to_offset(address)
 
-        # Value details
+        # 值处理 - 存储操作直接使用传入值，加载操作从模拟器内存读取
         val = value if is_store else int.from_bytes(
             model.emulator.mem_read(address, size), byteorder='little')
 
-        # Build and print the report string
+        # 构建并打印报告字符串
         type_str = "store to" if is_store else "load from"
         if CONF.color:
             msg = f"    > {CYAN}{type_str}{COL_RESET} +0x{normalized_address:x} " \
@@ -487,28 +630,37 @@ class ModelLogger:
     def dbg_instruction(self, pc: int, model: UnicornModel, state: ModelExecutionState,
                         speculator: UnicornSpeculator) -> None:
         """
-        Print debug information about the current instruction, if debugging is enabled.
-        The information includes:
-          - Instruction name and operands
-          - Current register values
-          - Whether the instruction is speculative, and if so, the speculative nesting level
+        打印当前指令的调试信息。
+
+        显示内容包括：
+        - 指令名称和操作数
+        - 当前寄存器值
+        - 是否处于推测执行状态（推测中则显示嵌套层级）
+        - 是否为测试用例退出指令
+
+        推测中的指令用黄色标记，正常指令用绿色标记。
+
+        :param pc: 当前程序计数器值
+        :param model: 被调试的合约模型实例
+        :param state: 模型执行状态对象
+        :param speculator: 推测器实例
         """
         if not __debug__:
             return
         if not self._conf.dbg_model:
             return
 
-        # Instruction details
+        # 指令详情
         instruction = state.current_instruction
         name = str(instruction)
         code_offset = model.layout.code_addr_to_offset(pc)
         is_exit = state.is_exit_addr(pc)
 
-        # Speculation details
+        # 推测状态详情
         in_speculation = speculator.in_speculation()
         nesting = speculator.nesting()
 
-        # Build and print the report string
+        # 构建并打印指令字符串 - 推测中用黄色，正常用绿色
         inst_str = name
         if CONF.color:
             if in_speculation:
@@ -516,17 +668,21 @@ class ModelLogger:
             else:
                 inst_str = GREEN + inst_str + COL_RESET
         if in_speculation:
-            inst_str = f"[transient, nesting = {nesting}] " + inst_str
+            inst_str = f"[transient, nesting = {nesting}] " + inst_str  # 推测中标记嵌套层级
         inst_str = f"0x{code_offset:<2x}: {inst_str}"
         if is_exit:
             inst_str += " [test_case_exit]"
         print(inst_str)
 
-        # Print the register values
+        # 打印当前寄存器值
         model.print_registers(oneline=True)
 
     def dbg_rollback(self, address: int) -> None:
-        """ Print a message indicating that the model has rolled back to a specific address """
+        """打印推测回滚消息 - 显示模型回滚到的地址。
+
+        参数:
+            address: 回滚目标地址
+        """
         if not __debug__:
             return
         if not self._conf.dbg_model:
@@ -541,7 +697,12 @@ class ModelLogger:
         print(msg)
 
     def dbg_exception(self, errno: int, descr: str) -> None:
-        """ Print a message indicating that an exception has occurred """
+        """打印异常消息 - 显示异常编号和描述。
+
+        参数:
+            errno: 异常编号
+            descr: 异常描述文本
+        """
         if not __debug__:
             return
 
@@ -555,21 +716,27 @@ class ModelLogger:
 
 
 class GeneratorLogger:
-    """ A class that provides logging services for the Program Generator module """
+    """ 程序生成器日志类 - 提供生成器调试输出服务。"""
 
     def __init__(self) -> None:
         self._conf = _LoggingConfig()
 
     def dbg_dump_instruction_pool(self, instructions: List[InstructionSpec]) -> None:
         """
-        Print the instruction pool used by the Program Generator, if debugging is enabled.
-        The instructions are grouped by category and printed in a human-readable format.
+        打印程序生成器使用的指令池。
+
+        在 dbg_generator 模式启用时，按类别分组打印可用指令列表，
+        显示每个类别中的指令名称和总数。
+
+        参数:
+            instructions: 指令规范对象列表
         """
         if not __debug__:
             return
         if not self._conf.dbg_generator or not CONF.is_generation_enabled():
             return
 
+        # 按类别分组指令
         instructions_by_category: Dict[str, Set[str]] = {i.category: set() for i in instructions}
         for i in instructions:
             instructions_by_category[i.category].add(i.name)
@@ -582,13 +749,19 @@ class GeneratorLogger:
 
 
 class ExecutorLogger:
-    """ A class that provides logging services for the Executor module """
+    """ 执行器日志类 - 提供执行器调试输出服务。"""
 
     def __init__(self) -> None:
         self._conf = _LoggingConfig()
 
     def dbg_dump_raw_traces(self, htraces: List[HTrace]) -> None:
-        """ Print the raw traces collected by the executor """
+        """打印执行器收集的原始硬件追踪数据。
+
+        在 dbg_executor_raw 模式启用时输出。
+
+        参数:
+            htraces: 硬件追踪列表
+        """
         if not __debug__:
             return
         if not self._conf.dbg_executor_raw:
@@ -601,15 +774,20 @@ class ExecutorLogger:
 
 
 class ISALogger:
-    """ A class that provides logging services for the isa_spec module """
+    """ ISA 规范日志类 - 提供指令过滤的调试输出服务。"""
 
     def __init__(self) -> None:
         self._conf = _LoggingConfig()
 
     def dbg_dump_filtering_reason(self, instruction: InstructionSpec, reason: str) -> None:
         """
-        Print the reason why a specific instruction was filtered out by the ISA module,
-        if debugging is enabled.
+        打印指令被 ISA 规范模块过滤掉的原因。
+
+        在 dbg_isa_filter 模式启用时，显示被过滤指令的名称、类别和过滤原因。
+
+        参数:
+            instruction: 被过滤的指令规范对象
+            reason: 过滤原因描述
         """
         if not __debug__:
             return

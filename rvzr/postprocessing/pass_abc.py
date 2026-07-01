@@ -1,4 +1,12 @@
-""" File: Abstract interfaces for minimization passes and common functionality.
+"""
+文件：最小化pass的抽象接口和公共功能。
+
+该模块定义了所有最小化pass的基类BaseMinimizationPass，
+提供了公共功能包括：
+- 从指令列表创建测试用例对象
+- 检查测试用例是否触发违规
+- 设置忽略列表
+- 根据指令集架构确定注释符号和基地址寄存器
 
 Copyright (C) Microsoft Corporation
 SPDX-License-Identifier: MIT
@@ -20,44 +28,60 @@ if TYPE_CHECKING:
 
 
 class BaseMinimizationPass(abc.ABC):
-    """ Base class for all minimization passes. Provides common functionality """
+    """
+    所有最小化pass的基类，提供公共功能。
+    
+    包括：
+    - 模糊测试器实例引用，用于执行验证
+    - 指令集规范引用，用于指令处理
+    - 进度打印器，用于输出最小化进度
+    - 忽略列表，指定验证时应忽略的输入ID
+    - 注释符号和基地址寄存器，根据指令集架构自动确定
+    """
     name: str = ""
-    _fuzzer: Final[Fuzzer]
-    _instruction_set_spec: Final[InstructionSet]
-    _progress: Final[ProgressPrinter]
-    _ignore_list: List[int]
+    _fuzzer: Final[Fuzzer]  # 模糊测试器实例
+    _instruction_set_spec: Final[InstructionSet]  # 指令集规范
+    _progress: Final[ProgressPrinter]  # 进度打印器
+    _ignore_list: List[int]  # 验证时应忽略的输入ID列表
 
     def __init__(self, fuzzer: Fuzzer, instruction_set_spec: InstructionSet,
                  progress: ProgressPrinter):
+        """
+        初始化最小化pass基类。
+        :param fuzzer: 模糊测试器实例
+        :param instruction_set_spec: 指令集规范
+        :param progress: 进度打印器
+        """
         self._fuzzer = fuzzer
         self._instruction_set_spec = instruction_set_spec
         self._progress = progress
         self._ignore_list = []
 
-        self._comment_symbol = "#" if CONF.instruction_set == "x86-64" else "//"
-        self._base_register = "r14" if CONF.instruction_set == "x86-64" else "x20"
+        # 根据指令集架构确定注释符号和基地址寄存器
+        self._comment_symbol = "#" if CONF.instruction_set == "x86-64" else "//"  # x86用#，arm64用//
+        self._base_register = "r14" if CONF.instruction_set == "x86-64" else "x20"  # x86用r14，arm64用x20
 
     def set_ignore_list(self, ignore_list: List[int]) -> None:
-        """ Set the list of input IDs to ignore """
+        """ 设置验证时应忽略的输入ID列表 """
         self._ignore_list = ignore_list
 
     def _get_test_case_from_instructions(self,
                                          instructions: List[str],
                                          path: str = "") -> TestCaseProgram:
         """
-        Create a test case object from a list of instructions.
-        The test case is stored in a file at the given path.
-        :param instructions: List of instructions
-        :param path: Path to store the test case; if empty, a temporary file is created
-        :return: Test case object
+        从指令列表创建测试用例对象。
+        指令被写入文件，然后通过汇编解析器解析为测试用例对象。
+        :param instructions: 指令列表（每行一条指令）
+        :param path: 存储测试用例的文件路径；如果为空，创建临时文件
+        :return: 解析后的测试用例对象
         """
-        # create a temporary file if no path is given
+        # 如果未指定路径，创建临时文件
         if not path:
             with tempfile.NamedTemporaryFile(dir="/tmp/rvzr_minimize", delete=False) as fp:
                 path = fp.name
         # print(path)
 
-        # write the instructions to the file
+        # 将指令写入文件
         with open(path, "w+") as f:
             for line in instructions:
                 f.write(line)
@@ -68,13 +92,14 @@ class BaseMinimizationPass(abc.ABC):
     def _check_for_violation(self, test_case: TestCaseProgram, inputs: List[InputData],
                              local_ignore_list: List[int]) -> bool:
         """
-        Check if the test case triggers the violation.
-        :param test_case: The test case to check
-        :param inputs: List of inputs to use for verification
-        :param ignore_list: List of input IDs to ignore
-        :return: True if the violation is triggered, False otherwise
+        检查测试用例是否触发违规。
+        多次重试以提高检测的可靠性。
+        :param test_case: 待检查的测试用例
+        :param inputs: 用于验证的输入列表
+        :param local_ignore_list: 验证时应忽略的输入ID列表
+        :return: True表示违规被触发，False表示未触发
         """
-        for _ in range(CONF.minimizer_retries):
+        for _ in range(CONF.minimizer_retries):  # 多次重试
             violation = self._fuzzer.fuzzing_round(test_case, inputs, local_ignore_list)
             if violation is not None:
                 return True
